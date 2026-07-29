@@ -37,6 +37,7 @@ const CLOSE_BEHAVIORS = new Set(["ask", "tray", "quit"])
 const WRITING_RULE_EXTENSIONS = new Set([".md", ".markdown", ".mdc", ".txt"])
 const MAX_WRITING_RULE_FILES = 100
 const MAX_WRITING_RULE_PROMPT_LENGTH = 60_000
+const WRITING_RULE_SETTINGS_FILE = ".author-desk.json"
 const PROJECT_REQUIRED_DIRECTORIES = [
   "正文",
   ".chat",
@@ -264,7 +265,10 @@ const AI_CHAT_TOOLS = [
         type: "object",
         properties: {
           path: { type: "string", description: "相对于当前小说目录的路径" },
-          old_text: { type: "string", description: "文件中必须存在的原文" },
+          old_text: {
+            type: "string",
+            description: "文件中必须存在的原文；目标是 0 字节空文件时传空字符串",
+          },
           new_text: { type: "string", description: "替换后的新文本" },
           replace_all: { type: "boolean", description: "是否替换全部匹配，默认只替换第一处" },
         },
@@ -390,25 +394,76 @@ async function saveAiPendingChangeSet(projectPath, pendingChanges) {
   }))
   await fs.promises.mkdir(path.dirname(changeSetPath), { recursive: true })
   await fs.promises.writeFile(changeSetPath, `${JSON.stringify({
-    version: 1,
+    version: 2,
     id: changeSetId,
+    status: "pending",
     createdAt: new Date().toISOString(),
+    changeCount: changes.length,
     changes,
   }, null, 2)}\n`, { encoding: "utf8", flag: "wx" })
   return changeSetId
 }
 
-async function readAiPendingChangeSet(projectPath, changeSetIdInput) {
+async function writeAiChangeSetState(changeSetPath, state) {
+  const temporaryPath = `${changeSetPath}.${process.pid}.tmp`
+  await fs.promises.writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, "utf8")
+  try {
+    await fs.promises.rename(temporaryPath, changeSetPath)
+  } catch (error) {
+    await fs.promises.unlink(temporaryPath).catch(() => {})
+    throw error
+  }
+}
+
+async function readAiPendingChangeSet(
+  projectPath,
+  changeSetIdInput,
+  { allowMissing = false } = {},
+) {
   const changeSetId = normalizeAiChangeSetId(changeSetIdInput)
   const changeSetPath = getAiPendingChangePath(projectPath, changeSetId)
   let data
   try {
     data = JSON.parse(await fs.promises.readFile(changeSetPath, "utf8"))
   } catch (error) {
+    if (error?.code === "ENOENT" && allowMissing) {
+      return {
+        changeSetId,
+        changeSetPath,
+        status: "missing",
+        changeCount: 0,
+        changes: [],
+        toolEvents: [],
+      }
+    }
     if (error?.code === "ENOENT") throw new Error("这组待确认修改已经不存在，可能已保存或取消")
     throw new Error(`无法读取待确认修改：${error instanceof Error ? error.message : String(error)}`)
   }
-  if (data?.id !== changeSetId || !Array.isArray(data?.changes) || !data.changes.length) {
+  if (data?.id !== changeSetId) {
+    throw new Error("待确认修改文件格式无效")
+  }
+  const status = ["pending", "saved", "canceled"].includes(data?.status)
+    ? data.status
+    : "pending"
+  const changeCount = Number.isFinite(data?.changeCount)
+    ? Math.max(0, Math.floor(data.changeCount))
+    : Array.isArray(data?.changes)
+      ? data.changes.length
+      : 0
+  const toolEvents = Array.isArray(data?.toolEvents)
+    ? data.toolEvents.map(normalizeAiToolEvent).filter(Boolean)
+    : []
+  if (status !== "pending") {
+    return {
+      changeSetId,
+      changeSetPath,
+      status,
+      changeCount,
+      changes: [],
+      toolEvents,
+    }
+  }
+  if (!Array.isArray(data?.changes) || !data.changes.length) {
     throw new Error("待确认修改文件格式无效")
   }
   const changes = data.changes.map((change) => {
@@ -422,11 +477,30 @@ async function readAiPendingChangeSet(projectPath, changeSetIdInput) {
       afterContent: String(change?.afterContent || ""),
     }
   })
-  return { changeSetId, changeSetPath, changes }
+  return {
+    changeSetId,
+    changeSetPath,
+    status,
+    changeCount,
+    changes,
+    toolEvents,
+  }
 }
 
 async function applyAiPendingChangeSet(projectPath, changeSetIdInput) {
   const pending = await readAiPendingChangeSet(projectPath, changeSetIdInput)
+  if (pending.status === "saved") {
+    return {
+      ok: true,
+      status: "saved",
+      alreadyResolved: true,
+      appliedCount: pending.changeCount,
+      toolEvents: pending.toolEvents,
+    }
+  }
+  if (pending.status === "canceled") {
+    throw new Error("这组修改已经取消，无法再次保存")
+  }
   const realProjectPath = await fs.promises.realpath(projectPath)
   const validatedChanges = []
 
@@ -435,12 +509,29 @@ async function applyAiPendingChangeSet(projectPath, changeSetIdInput) {
     if (change.kind === "created") {
       await assertAiTargetParentInsideProject(realProjectPath, targetPath)
       try {
-        await fs.promises.lstat(targetPath)
-        throw new Error(`“${relativePath}”已经存在，未执行覆盖`)
+        const stats = await fs.promises.lstat(targetPath)
+        if (!stats.isFile() || stats.isSymbolicLink()) {
+          throw new Error(`“${relativePath}”已经存在且不是普通文件，未执行覆盖`)
+        }
+        const currentContent = await readAiTextFile(targetPath)
+        if (currentContent !== change.afterContent) {
+          throw new Error(`“${relativePath}”已经存在且内容不同，未执行覆盖`)
+        }
+        validatedChanges.push({
+          ...change,
+          targetPath,
+          relativePath,
+          needsWrite: false,
+        })
       } catch (error) {
         if (error?.code !== "ENOENT") throw error
+        validatedChanges.push({
+          ...change,
+          targetPath,
+          relativePath,
+          needsWrite: true,
+        })
       }
-      validatedChanges.push({ ...change, targetPath, relativePath })
       continue
     }
 
@@ -449,17 +540,22 @@ async function applyAiPendingChangeSet(projectPath, changeSetIdInput) {
       throw new Error(`“${relativePath}”符号链接指向小说目录之外`)
     }
     const currentContent = await readAiTextFile(realTargetPath)
-    if (currentContent !== change.beforeContent) {
+    if (
+      currentContent !== change.beforeContent
+      && currentContent !== change.afterContent
+    ) {
       throw new Error(`“${relativePath}”在 AI 生成差异后又发生了变化，请取消本次修改后重新生成`)
     }
     validatedChanges.push({
       ...change,
       targetPath: realTargetPath,
       relativePath,
+      needsWrite: currentContent !== change.afterContent,
     })
   }
 
   for (const change of validatedChanges) {
+    if (!change.needsWrite) continue
     if (change.kind === "created") {
       await fs.promises.mkdir(path.dirname(change.targetPath), { recursive: true })
       const realParentPath = await fs.promises.realpath(path.dirname(change.targetPath))
@@ -475,24 +571,72 @@ async function applyAiPendingChangeSet(projectPath, changeSetIdInput) {
     }
   }
 
-  await fs.promises.unlink(pending.changeSetPath)
+  const toolEvents = validatedChanges.map((change) => ({
+    kind: change.kind,
+    path: change.relativePath,
+    label: change.kind === "created" ? "已创建文件" : "已修改文件",
+    diff: createTextDiff(change.relativePath, change.beforeContent, change.afterContent),
+  }))
+  await writeAiChangeSetState(pending.changeSetPath, {
+    version: 2,
+    id: pending.changeSetId,
+    status: "saved",
+    resolvedAt: new Date().toISOString(),
+    changeCount: validatedChanges.length,
+    toolEvents,
+  })
   return {
     ok: true,
+    status: "saved",
+    alreadyResolved: validatedChanges.every((change) => !change.needsWrite),
     appliedCount: validatedChanges.length,
-    toolEvents: validatedChanges.map((change) => ({
-      kind: change.kind,
-      path: change.relativePath,
-      label: change.kind === "created" ? "已创建文件" : "已修改文件",
-      diff: createTextDiff(change.relativePath, change.beforeContent, change.afterContent),
-    })),
+    toolEvents,
   }
 }
 
 async function discardAiPendingChangeSet(projectPath, changeSetIdInput) {
-  const pending = await readAiPendingChangeSet(projectPath, changeSetIdInput)
-  await fs.promises.unlink(pending.changeSetPath)
+  const pending = await readAiPendingChangeSet(
+    projectPath,
+    changeSetIdInput,
+    { allowMissing: true },
+  )
+  if (pending.status === "missing") {
+    return {
+      ok: true,
+      status: "missing",
+      alreadyResolved: true,
+      discardedCount: 0,
+    }
+  }
+  if (pending.status === "saved") {
+    return {
+      ok: true,
+      status: "saved",
+      alreadyResolved: true,
+      discardedCount: 0,
+      appliedCount: pending.changeCount,
+      toolEvents: pending.toolEvents,
+    }
+  }
+  if (pending.status === "canceled") {
+    return {
+      ok: true,
+      status: "canceled",
+      alreadyResolved: true,
+      discardedCount: pending.changeCount,
+    }
+  }
+  await writeAiChangeSetState(pending.changeSetPath, {
+    version: 2,
+    id: pending.changeSetId,
+    status: "canceled",
+    resolvedAt: new Date().toISOString(),
+    changeCount: pending.changeCount,
+  })
   return {
     ok: true,
+    status: "canceled",
+    alreadyResolved: false,
     discardedCount: pending.changes.length,
   }
 }
@@ -665,7 +809,6 @@ async function executeAiFileTool(toolName, args, toolContext) {
     }
     const oldText = String(args.old_text || "")
     const newText = String(args.new_text || "")
-    if (!oldText) throw new Error("old_text 不能为空")
     const existingChange = toolContext.pendingChanges.get(relativePath)
     let beforeContent
     if (existingChange) {
@@ -675,10 +818,17 @@ async function executeAiFileTool(toolName, args, toolContext) {
       if (!isPathContained(realProjectPath, realTargetPath)) throw new Error("文件符号链接指向小说目录之外")
       beforeContent = await readAiTextFile(realTargetPath)
     }
-    if (!beforeContent.includes(oldText)) throw new Error("文件中找不到需要替换的精确原文")
-    const afterContent = args.replace_all === true
-      ? beforeContent.split(oldText).join(newText)
-      : beforeContent.replace(oldText, newText)
+    if (!oldText && beforeContent.length > 0) {
+      throw new Error("只有 0 字节空文件允许 old_text 为空；非空文件必须提供需要替换的精确原文")
+    }
+    if (oldText && !beforeContent.includes(oldText)) {
+      throw new Error("文件中找不到需要替换的精确原文")
+    }
+    const afterContent = oldText
+      ? args.replace_all === true
+        ? beforeContent.split(oldText).join(newText)
+        : beforeContent.replace(oldText, newText)
+      : newText
     const originalContent = existingChange?.beforeContent ?? beforeContent
     const changeKind = existingChange?.kind ?? "modified"
     const diff = createTextDiff(relativePath, originalContent, afterContent)
@@ -958,7 +1108,7 @@ function normalizeAiHistoryMessages(messages) {
       const changeSetId = String(message.changeSetId || "").trim()
       if (/^[a-f0-9-]{36}$/i.test(changeSetId)) normalized.changeSetId = changeSetId
       const changeStatus = String(message.changeStatus || "")
-      if (["pending", "saved", "canceled"].includes(changeStatus)) {
+      if (["pending", "saved", "canceled", "expired"].includes(changeStatus)) {
         normalized.changeStatus = changeStatus
       }
       return normalized
@@ -966,13 +1116,74 @@ function normalizeAiHistoryMessages(messages) {
     .filter(Boolean)
 }
 
+async function reconcileAiPendingMessageStates(projectPath, messages) {
+  return Promise.all(messages.map(async (message) => {
+    if (message.changeStatus !== "pending" || !message.changeSetId) return message
+    let changeSet
+    try {
+      changeSet = await readAiPendingChangeSet(
+        projectPath,
+        message.changeSetId,
+        { allowMissing: true },
+      )
+    } catch {
+      return {
+        ...message,
+        changeStatus: "expired",
+        status: "待确认修改已损坏，已解除阻塞",
+      }
+    }
+    if (changeSet.status === "pending") return message
+    if (changeSet.status === "saved") {
+      const savedEvents = new Map(
+        changeSet.toolEvents.map((event) => [event.path, event]),
+      )
+      return {
+        ...message,
+        changeStatus: "saved",
+        status: `已保存 ${changeSet.changeCount} 项修改`,
+        toolEvents: message.toolEvents?.map((event) => savedEvents.get(event.path) || event),
+      }
+    }
+    if (changeSet.status === "canceled") {
+      return {
+        ...message,
+        changeStatus: "canceled",
+        status: `已取消 ${changeSet.changeCount} 项修改`,
+        toolEvents: message.toolEvents?.map((event) => (
+          ["created", "modified"].includes(event.kind)
+            ? {
+                ...event,
+                label: event.kind === "created" ? "已取消创建" : "已取消修改",
+              }
+            : event
+        )),
+      }
+    }
+    return {
+      ...message,
+      changeStatus: "expired",
+      status: "待确认修改已失效，已解除阻塞",
+      toolEvents: message.toolEvents?.map((event) => (
+        ["created", "modified"].includes(event.kind)
+          ? { ...event, label: "修改记录已失效" }
+          : event
+      )),
+    }
+  }))
+}
+
 async function getAiChatHistory(projectPath) {
   const historyPath = getAiChatHistoryPath(projectPath)
   try {
     const rawText = await fs.promises.readFile(historyPath, "utf8")
     const data = JSON.parse(rawText)
+    const messages = await reconcileAiPendingMessageStates(
+      projectPath,
+      normalizeAiHistoryMessages(data?.messages),
+    )
     return {
-      messages: normalizeAiHistoryMessages(data?.messages),
+      messages,
       summary: typeof data?.summary === "string" ? data.summary.slice(0, 20_000) : "",
       compactedCount: Number.isFinite(data?.compactedCount)
         ? Math.max(0, Math.floor(data.compactedCount))
@@ -1198,6 +1409,7 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
         "分析多个章节时，先调用 list_chapters 获取准确目录，再使用 read_chapters 一次批量读取相关章节；不要逐章反复调用 read_file。",
         "只有用户明确要求创建或修改文件时，才可调用 create_file 或 modify_file。",
         "修改文件前应先读取文件并使用 preview_file_diff 检查拟议变化；所有写操作只会暂存，必须由用户查看差异并点击保存后才真正写入。",
+        "向 0 字节空文件首次写入内容时，调用 modify_file 并传 old_text=\"\"、new_text=完整内容；非空文件仍必须传入精确存在的 old_text。",
         "工具返回 staged=true 时，只能称为“已准备修改”或“等待用户确认”，不得声称文件已经保存。",
         "不得删除文件，不得访问当前小说目录之外的路径。",
         "回答和续写正文时直接输出清晰段落，不要把每一行写成 Markdown 引用块，不要反复使用行首符号 >。",
@@ -1515,9 +1727,85 @@ function writingRulesRoot(projectPath) {
   return path.join(path.resolve(projectPath), ".trae", "rules")
 }
 
+function writingRulesSettingsPath(projectPath) {
+  return path.join(writingRulesRoot(projectPath), WRITING_RULE_SETTINGS_FILE)
+}
+
+function normalizeWritingRuleRelativePath(projectPath, relativePathInput) {
+  const root = writingRulesRoot(projectPath)
+  const relativePath = String(relativePathInput || "").trim().replace(/\//g, path.sep)
+  if (!relativePath || path.isAbsolute(relativePath)) throw new Error("规则文件路径无效")
+  const targetPath = path.resolve(root, relativePath)
+  const containedPath = path.relative(root, targetPath)
+  if (!containedPath || containedPath.startsWith("..") || path.isAbsolute(containedPath)) {
+    throw new Error("规则文件必须位于 .trae/rules 目录中")
+  }
+  if (!WRITING_RULE_EXTENSIONS.has(path.extname(targetPath).toLowerCase())) {
+    throw new Error("规则文件仅支持 md、markdown、mdc 或 txt")
+  }
+  return {
+    root,
+    targetPath,
+    relativePath: path.relative(root, targetPath).replace(/\\/g, "/"),
+  }
+}
+
+function normalizeNewWritingRuleName(nameInput) {
+  const trimmedName = String(nameInput || "").trim()
+  const name = path.extname(trimmedName) ? trimmedName : `${trimmedName}.md`
+  if (
+    !trimmedName
+    || path.basename(name) !== name
+    || /[<>:"/\\|?*\u0000-\u001f]/.test(name)
+    || /[. ]$/.test(name)
+    || !WRITING_RULE_EXTENSIONS.has(path.extname(name).toLowerCase())
+  ) {
+    throw new Error("规则名称无效，请使用普通文件名")
+  }
+  return name
+}
+
+async function readWritingRuleSettings(projectPath) {
+  const settingsPath = writingRulesSettingsPath(projectPath)
+  try {
+    const data = JSON.parse(await fs.promises.readFile(settingsPath, "utf8"))
+    const disabledRules = Array.isArray(data?.disabledRules)
+      ? [...new Set(data.disabledRules.map((item) => String(item || "").replace(/\\/g, "/")).filter(Boolean))]
+      : []
+    return { version: 1, disabledRules }
+  } catch (error) {
+    if (error?.code === "ENOENT") return { version: 1, disabledRules: [] }
+    throw new Error(`无法读取写作规则设置：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+async function writeWritingRuleSettings(projectPath, state) {
+  const settingsPath = writingRulesSettingsPath(projectPath)
+  const normalized = {
+    version: 1,
+    disabledRules: [...new Set(
+      (Array.isArray(state?.disabledRules) ? state.disabledRules : [])
+        .map((item) => String(item || "").replace(/\\/g, "/"))
+        .filter(Boolean),
+    )].sort((left, right) => left.localeCompare(right, "zh-CN", { numeric: true })),
+  }
+  await fs.promises.mkdir(path.dirname(settingsPath), { recursive: true })
+  const temporaryPath = `${settingsPath}.${process.pid}.tmp`
+  await fs.promises.writeFile(temporaryPath, `${JSON.stringify(normalized, null, 2)}\n`, "utf8")
+  try {
+    await fs.promises.rename(temporaryPath, settingsPath)
+  } catch (error) {
+    await fs.promises.unlink(temporaryPath).catch(() => {})
+    throw error
+  }
+  return normalized
+}
+
 function createWritingRulesPrompt(state) {
   if (!state || !Array.isArray(state.rules) || !state.rules.length) return ""
-  const sections = state.rules.map((rule) => [
+  const enabledRules = state.rules.filter((rule) => rule.enabled !== false)
+  if (!enabledRules.length) return ""
+  const sections = enabledRules.map((rule) => [
     `\n\n===== 写作规则：${rule.relativePath} =====`,
     rule.content,
   ].join("\n"))
@@ -1558,6 +1846,8 @@ async function readWritingRules(projectPath) {
   if (!isPathContained(realProjectPath, realRulesRoot)) {
     throw new Error("Trae 规则目录指向当前作品之外")
   }
+  const ruleSettings = await readWritingRuleSettings(normalizedProject)
+  const disabledRules = new Set(ruleSettings.disabledRules)
 
   const rulePaths = []
   async function collectRules(directoryPath, relativeDirectory = "", depth = 0) {
@@ -1603,6 +1893,7 @@ async function readWritingRules(projectPath) {
       relativePath: rulePath.relativePath,
       path: realRulePath,
       content,
+      enabled: !disabledRules.has(rulePath.relativePath),
       characterCount: content.length,
       headings,
       modifiedAt: stats.mtime.toISOString(),
@@ -1622,6 +1913,116 @@ async function readWritingRules(projectPath) {
   }
   state.injectedCharacters = createWritingRulesPrompt(state).length
   return state
+}
+
+async function createWritingRule(projectPath, input) {
+  if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) {
+    throw new Error("作品目录不在当前小说库中")
+  }
+  const normalizedProject = path.resolve(projectPath)
+  const name = normalizeNewWritingRuleName(input?.name)
+  const content = String(input?.content || "")
+  if (content.length > 512 * 1024) throw new Error("单个规则不能超过 512KB")
+  const root = writingRulesRoot(normalizedProject)
+  await fs.promises.mkdir(root, { recursive: true })
+  const realProjectPath = await fs.promises.realpath(normalizedProject)
+  const realRulesRoot = await fs.promises.realpath(root)
+  if (!isPathContained(realProjectPath, realRulesRoot)) {
+    throw new Error("Trae 规则目录指向当前作品之外")
+  }
+  const targetPath = path.join(realRulesRoot, name)
+  try {
+    await fs.promises.writeFile(targetPath, content, { encoding: "utf8", flag: "wx" })
+  } catch (error) {
+    if (error?.code === "EEXIST") throw new Error("同名规则已经存在")
+    throw error
+  }
+  const settings = await readWritingRuleSettings(normalizedProject)
+  if (settings.disabledRules.includes(name)) {
+    await writeWritingRuleSettings(normalizedProject, {
+      disabledRules: settings.disabledRules.filter((item) => item !== name),
+    })
+  }
+  return {
+    relativePath: name,
+    state: await readWritingRules(normalizedProject),
+  }
+}
+
+async function saveWritingRule(projectPath, relativePathInput, contentInput) {
+  if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) {
+    throw new Error("作品目录不在当前小说库中")
+  }
+  const content = String(contentInput || "")
+  if (content.length > 512 * 1024) throw new Error("单个规则不能超过 512KB")
+  const normalizedProject = path.resolve(projectPath)
+  const { root, targetPath, relativePath } = normalizeWritingRuleRelativePath(
+    normalizedProject,
+    relativePathInput,
+  )
+  const realRulesRoot = await fs.promises.realpath(root)
+  const realTargetPath = await fs.promises.realpath(targetPath)
+  if (!isPathContained(realRulesRoot, realTargetPath)) {
+    throw new Error("规则文件指向目录之外")
+  }
+  const stats = await fs.promises.stat(realTargetPath)
+  if (!stats.isFile()) throw new Error("目标规则不是文件")
+  await fs.promises.writeFile(realTargetPath, content, "utf8")
+  return {
+    relativePath,
+    state: await readWritingRules(normalizedProject),
+  }
+}
+
+async function setWritingRuleEnabled(projectPath, relativePathInput, enabledInput) {
+  if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) {
+    throw new Error("作品目录不在当前小说库中")
+  }
+  const normalizedProject = path.resolve(projectPath)
+  const { targetPath, relativePath } = normalizeWritingRuleRelativePath(
+    normalizedProject,
+    relativePathInput,
+  )
+  const stats = await fs.promises.stat(targetPath)
+  if (!stats.isFile()) throw new Error("目标规则不是文件")
+  const settings = await readWritingRuleSettings(normalizedProject)
+  const disabledRules = new Set(settings.disabledRules)
+  if (enabledInput === true) disabledRules.delete(relativePath)
+  else disabledRules.add(relativePath)
+  await writeWritingRuleSettings(normalizedProject, {
+    disabledRules: [...disabledRules],
+  })
+  return {
+    relativePath,
+    state: await readWritingRules(normalizedProject),
+  }
+}
+
+async function deleteWritingRule(projectPath, relativePathInput) {
+  if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) {
+    throw new Error("作品目录不在当前小说库中")
+  }
+  const normalizedProject = path.resolve(projectPath)
+  const { root, targetPath, relativePath } = normalizeWritingRuleRelativePath(
+    normalizedProject,
+    relativePathInput,
+  )
+  const realRulesRoot = await fs.promises.realpath(root)
+  const realTargetPath = await fs.promises.realpath(targetPath)
+  if (!isPathContained(realRulesRoot, realTargetPath)) {
+    throw new Error("规则文件指向目录之外")
+  }
+  const stats = await fs.promises.stat(realTargetPath)
+  if (!stats.isFile()) throw new Error("目标规则不是文件")
+  const settings = await readWritingRuleSettings(normalizedProject)
+  await fs.promises.unlink(realTargetPath)
+  await writeWritingRuleSettings(normalizedProject, {
+    disabledRules: settings.disabledRules.filter((item) => item !== relativePath),
+  })
+  return {
+    relativePath,
+    state: await readWritingRules(normalizedProject),
+  }
 }
 
 async function readProjectManuscript(projectPath) {
@@ -3424,6 +3825,22 @@ ipcMain.handle("characters:get", (_event, projectPath) => getCharacterGraph(proj
 ipcMain.handle("characters:summarize", (_event, projectPath) => requestCharacterSummary(projectPath))
 
 ipcMain.handle("rules:get", (_event, projectPath) => readWritingRules(projectPath))
+
+ipcMain.handle("rules:create", (_event, projectPath, input) => (
+  createWritingRule(projectPath, input)
+))
+
+ipcMain.handle("rules:save", (_event, projectPath, relativePath, content) => (
+  saveWritingRule(projectPath, relativePath, content)
+))
+
+ipcMain.handle("rules:set-enabled", (_event, projectPath, relativePath, enabled) => (
+  setWritingRuleEnabled(projectPath, relativePath, enabled)
+))
+
+ipcMain.handle("rules:delete", (_event, projectPath, relativePath) => (
+  deleteWritingRule(projectPath, relativePath)
+))
 
 ipcMain.handle("rules:open-folder", async (_event, projectPath) => {
   if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) return false

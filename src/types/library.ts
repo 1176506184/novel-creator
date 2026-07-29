@@ -88,6 +88,7 @@ export type WritingRuleFile = {
   relativePath: string
   path: string
   content: string
+  enabled: boolean
   characterCount: number
   headings: string[]
   modifiedAt: string
@@ -100,6 +101,11 @@ export type WritingRulesState = {
   rules: WritingRuleFile[]
   totalCharacters: number
   injectedCharacters: number
+}
+
+export type WritingRuleMutationResult = {
+  relativePath: string
+  state: WritingRulesState
 }
 
 export type ReferenceStyleProfile = {

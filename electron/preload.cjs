@@ -91,6 +91,16 @@ contextBridge.exposeInMainWorld("authorDesk", {
   },
   rules: {
     get: (projectPath) => ipcRenderer.invoke("rules:get", projectPath),
+    create: (projectPath, input) => ipcRenderer.invoke("rules:create", projectPath, input),
+    save: (projectPath, relativePath, content) => (
+      ipcRenderer.invoke("rules:save", projectPath, relativePath, content)
+    ),
+    setEnabled: (projectPath, relativePath, enabled) => (
+      ipcRenderer.invoke("rules:set-enabled", projectPath, relativePath, enabled)
+    ),
+    delete: (projectPath, relativePath) => (
+      ipcRenderer.invoke("rules:delete", projectPath, relativePath)
+    ),
     openFolder: (projectPath) => ipcRenderer.invoke("rules:open-folder", projectPath),
   },
   referenceStyle: {

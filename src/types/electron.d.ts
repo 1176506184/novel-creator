@@ -111,7 +111,7 @@ type AiStoredMessage = AiChatMessage & {
   status?: string
   hasError?: boolean
   changeSetId?: string
-  changeStatus?: "pending" | "saved" | "canceled"
+  changeStatus?: "pending" | "saved" | "canceled" | "expired"
 }
 
 type AiChatHistory = {
@@ -178,6 +178,7 @@ type WritingRuleFile = {
   relativePath: string
   path: string
   content: string
+  enabled: boolean
   characterCount: number
   headings: string[]
   modifiedAt: string
@@ -190,6 +191,11 @@ type WritingRulesState = {
   rules: WritingRuleFile[]
   totalCharacters: number
   injectedCharacters: number
+}
+
+type WritingRuleMutationResult = {
+  relativePath: string
+  state: WritingRulesState
 }
 
 type ReferenceStyleProfile = {
@@ -356,12 +362,18 @@ declare global {
         cancelChat(requestId: string): Promise<boolean>
         applyChanges(projectPath: string, changeSetId: string): Promise<{
           ok: boolean
+          status: "saved"
+          alreadyResolved: boolean
           appliedCount: number
           toolEvents: AiToolEvent[]
         }>
         discardChanges(projectPath: string, changeSetId: string): Promise<{
           ok: boolean
+          status: "saved" | "canceled" | "missing"
+          alreadyResolved: boolean
           discardedCount: number
+          appliedCount?: number
+          toolEvents?: AiToolEvent[]
         }>
         getHistory(projectPath: string): Promise<AiChatHistory>
         saveHistory(projectPath: string, messages: AiStoredMessage[]): Promise<AiChatHistory>
@@ -377,6 +389,24 @@ declare global {
       }
       rules: {
         get(projectPath: string): Promise<WritingRulesState>
+        create(projectPath: string, input: {
+          name: string
+          content: string
+        }): Promise<WritingRuleMutationResult>
+        save(
+          projectPath: string,
+          relativePath: string,
+          content: string,
+        ): Promise<WritingRuleMutationResult>
+        setEnabled(
+          projectPath: string,
+          relativePath: string,
+          enabled: boolean,
+        ): Promise<WritingRuleMutationResult>
+        delete(
+          projectPath: string,
+          relativePath: string,
+        ): Promise<WritingRuleMutationResult>
         openFolder(projectPath: string): Promise<boolean>
       }
       referenceStyle: {

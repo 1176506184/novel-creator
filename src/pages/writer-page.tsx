@@ -75,7 +75,7 @@ type AiMessage = {
   status?: string
   hasError?: boolean
   changeSetId?: string
-  changeStatus?: "pending" | "saved" | "canceled"
+  changeStatus?: "pending" | "saved" | "canceled" | "expired"
 }
 
 type ChapterContextMenu = {
@@ -113,6 +113,20 @@ function formatAiChatError(error: unknown) {
 function isAiChatCanceledError(error: unknown) {
   const rawMessage = error instanceof Error ? error.message : String(error || "")
   return /AI_REQUEST_CANCELED|AiRequestCanceledError|AI 请求已由用户停止/i.test(rawMessage)
+}
+
+function formatAiChangeError(error: unknown) {
+  const rawMessage = error instanceof Error ? error.message : String(error || "")
+  return rawMessage
+    .replace(/^Error invoking remote method ['"]ai:(?:apply|discard)-changes['"]:\s*/i, "")
+    .replace(/^Error:\s*/i, "")
+    || "处理 AI 修改失败"
+}
+
+function isUnrecoverableAiChangeError(error: unknown) {
+  return /已经不存在|修改记录无效|文件格式无效|无法读取待确认修改|已经取消/i.test(
+    formatAiChangeError(error),
+  )
 }
 
 function formatGitSyncError(error: unknown) {
@@ -341,6 +355,7 @@ export function WriterPage({
   const [aiCompactedCount, setAiCompactedCount] = useState(0)
   const [aiInput, setAiInput] = useState("")
   const [aiError, setAiError] = useState("")
+  const [aiNotice, setAiNotice] = useState("")
   const [isAiThinking, setIsAiThinking] = useState(false)
   const [isAiStopping, setIsAiStopping] = useState(false)
   const [activeAiChangeSetId, setActiveAiChangeSetId] = useState("")
@@ -624,6 +639,7 @@ export function WriterPage({
     setAiCompactedCount(0)
     setAiInput("")
     setAiError("")
+    setAiNotice("")
     setIsAiStopping(false)
     setActiveAiChangeSetId("")
     setActiveAiChangeAction("")
@@ -651,6 +667,9 @@ export function WriterPage({
         updateAiMessages(history.messages)
         setAiChatSummary(history.summary)
         setAiCompactedCount(history.compactedCount)
+        if (history.messages.some((message) => message.changeStatus === "expired")) {
+          setAiNotice("检测到已经丢失的待确认修改，已自动解除阻塞；原 diff 仍保留在对话中。")
+        }
       })
       .catch((historyError) => {
         if (!isCurrent) return
@@ -900,27 +919,61 @@ export function WriterPage({
     setActiveAiChangeSetId(message.changeSetId)
     setActiveAiChangeAction("save")
     setAiError("")
+    setAiNotice("")
+    let result: Awaited<ReturnType<typeof window.authorDesk.ai.applyChanges>>
     try {
-      const result = await window.authorDesk.ai.applyChanges(project.path, message.changeSetId)
-      const appliedEvents = new Map(result.toolEvents.map((event) => [event.path, event]))
-      const nextMessages = aiMessagesRef.current.map((currentMessage) => {
-        if (currentMessage.id !== message.id) return currentMessage
-        return {
-          ...currentMessage,
-          changeStatus: "saved" as const,
-          status: `已保存 ${result.appliedCount} 项修改`,
-          toolEvents: currentMessage.toolEvents?.map((event) => (
-            appliedEvents.get(event.path) || event
-          )),
-        }
-      })
-      updateAiMessages(nextMessages)
-      await window.authorDesk.ai.saveHistory(project.path, nextMessages)
-      await refreshAfterAiTools(result.toolEvents)
+      result = await window.authorDesk.ai.applyChanges(project.path, message.changeSetId)
     } catch (applyError) {
-      setAiError(applyError instanceof Error
-        ? applyError.message
-        : "保存 AI 修改失败")
+      if (isUnrecoverableAiChangeError(applyError)) {
+        const expiredMessages = aiMessagesRef.current.map((currentMessage) => (
+          currentMessage.id === message.id
+            ? {
+                ...currentMessage,
+                changeStatus: "expired" as const,
+                status: "待确认修改已失效，已解除阻塞",
+                toolEvents: currentMessage.toolEvents?.map((event) => (
+                  ["created", "modified"].includes(event.kind)
+                    ? { ...event, label: "修改记录已失效" }
+                    : event
+                )),
+              }
+            : currentMessage
+        ))
+        updateAiMessages(expiredMessages)
+        setAiNotice(`${formatAiChangeError(applyError)}。已自动解除待确认状态，你可以继续使用 AI。`)
+        window.authorDesk.ai.saveHistory(project.path, expiredMessages).catch(() => {})
+      } else {
+        setAiError(formatAiChangeError(applyError))
+      }
+      setActiveAiChangeSetId("")
+      setActiveAiChangeAction("")
+      return
+    }
+
+    const appliedEvents = new Map(result.toolEvents.map((event) => [event.path, event]))
+    const nextMessages = aiMessagesRef.current.map((currentMessage) => {
+      if (currentMessage.id !== message.id) return currentMessage
+      return {
+        ...currentMessage,
+        changeStatus: "saved" as const,
+        status: `已保存 ${result.appliedCount} 项修改`,
+        toolEvents: currentMessage.toolEvents?.map((event) => (
+          appliedEvents.get(event.path) || event
+        )),
+      }
+    })
+    updateAiMessages(nextMessages)
+    try {
+      await window.authorDesk.ai.saveHistory(project.path, nextMessages)
+    } catch {
+      setAiNotice("文件已保存，但对话状态暂时未能写入；下次打开时会自动恢复，不会重复修改文件。")
+    }
+    try {
+      await refreshAfterAiTools(result.toolEvents)
+    } catch (refreshError) {
+      setAiError(refreshError instanceof Error
+        ? `修改已保存，但界面刷新失败：${refreshError.message}`
+        : "修改已保存，但作品界面刷新失败")
     } finally {
       setActiveAiChangeSetId("")
       setActiveAiChangeAction("")
@@ -932,30 +985,76 @@ export function WriterPage({
     setActiveAiChangeSetId(message.changeSetId)
     setActiveAiChangeAction("cancel")
     setAiError("")
+    setAiNotice("")
     try {
       const result = await window.authorDesk.ai.discardChanges(project.path, message.changeSetId)
+      const resolvedAsSaved = result.status === "saved"
+      const resolvedAsMissing = result.status === "missing"
+      const resolvedEvents = new Map(
+        (result.toolEvents || []).map((event) => [event.path, event]),
+      )
       const nextMessages = aiMessagesRef.current.map((currentMessage) => {
         if (currentMessage.id !== message.id) return currentMessage
         return {
           ...currentMessage,
-          changeStatus: "canceled" as const,
-          status: `已取消 ${result.discardedCount} 项修改`,
+          changeStatus: resolvedAsSaved
+            ? "saved" as const
+            : resolvedAsMissing
+              ? "expired" as const
+              : "canceled" as const,
+          status: resolvedAsSaved
+            ? `已保存 ${result.appliedCount || 0} 项修改`
+            : resolvedAsMissing
+              ? "待确认修改已失效，已解除阻塞"
+              : `已取消 ${result.discardedCount} 项修改`,
           toolEvents: currentMessage.toolEvents?.map((event) => (
-            ["created", "modified"].includes(event.kind)
-              ? {
-                  ...event,
-                  label: event.kind === "created" ? "已取消创建" : "已取消修改",
-                }
-              : event
+            resolvedAsSaved
+              ? resolvedEvents.get(event.path) || event
+              : ["created", "modified"].includes(event.kind)
+                ? {
+                    ...event,
+                    label: resolvedAsMissing
+                      ? "修改记录已失效"
+                      : event.kind === "created"
+                        ? "已取消创建"
+                        : "已取消修改",
+                  }
+                : event
           )),
         }
       })
       updateAiMessages(nextMessages)
-      await window.authorDesk.ai.saveHistory(project.path, nextMessages)
+      try {
+        await window.authorDesk.ai.saveHistory(project.path, nextMessages)
+      } catch {
+        setAiNotice("操作已经完成，但对话状态暂时未能写入；下次打开时会自动恢复。")
+      }
+      if (resolvedAsSaved && result.toolEvents?.length) {
+        try {
+          await refreshAfterAiTools(result.toolEvents)
+        } catch {
+          setAiError("修改已经保存，但作品界面刷新失败，请重新进入写作台。")
+        }
+      } else if (resolvedAsMissing) {
+        setAiNotice("待确认修改文件已经不存在，已移除失效状态，你可以继续使用 AI。")
+      }
     } catch (discardError) {
-      setAiError(discardError instanceof Error
-        ? discardError.message
-        : "取消 AI 修改失败")
+      if (isUnrecoverableAiChangeError(discardError)) {
+        const expiredMessages = aiMessagesRef.current.map((currentMessage) => (
+          currentMessage.id === message.id
+            ? {
+                ...currentMessage,
+                changeStatus: "expired" as const,
+                status: "待确认修改已失效，已解除阻塞",
+              }
+            : currentMessage
+        ))
+        updateAiMessages(expiredMessages)
+        setAiNotice(`${formatAiChangeError(discardError)}。已解除待确认状态，你可以继续使用 AI。`)
+        window.authorDesk.ai.saveHistory(project.path, expiredMessages).catch(() => {})
+      } else {
+        setAiError(formatAiChangeError(discardError))
+      }
     } finally {
       setActiveAiChangeSetId("")
       setActiveAiChangeAction("")
@@ -1022,6 +1121,7 @@ export function WriterPage({
     activeAiMessageIdRef.current = assistantMessageId
     setAiInput("")
     setAiError("")
+    setAiNotice("")
     setIsAiThinking(true)
     setIsAiStopping(false)
     try {
@@ -1530,6 +1630,7 @@ export function WriterPage({
                       setAiChatSummary("")
                       setAiCompactedCount(0)
                       setAiError("")
+                      setAiNotice("")
                       try {
                         await window.authorDesk.ai.clearHistory(project.path)
                       } catch (historyError) {
@@ -1641,6 +1742,8 @@ export function WriterPage({
                                   : message.isStreaming
                                     ? "ai-status-shimmer bg-secondary text-primary"
                                     : message.changeStatus === "pending"
+                                      ? "bg-amber-50 text-amber-700"
+                                    : message.changeStatus === "expired"
                                       ? "bg-amber-50 text-amber-700"
                                     : message.status === "已自动审核并收束"
                                       ? "bg-emerald-50 text-success"
@@ -1757,6 +1860,15 @@ export function WriterPage({
             </div>
 
             <div className="shrink-0 border-t border-border p-3">
+              {aiNotice && (
+                <div
+                  className="mb-2 flex items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-[11px] leading-4 text-emerald-700"
+                  role="status"
+                >
+                  <Check className="mt-0.5 size-3.5 shrink-0" />
+                  <span>{aiNotice}</span>
+                </div>
+              )}
               {aiError && (
                 <div className="mb-2 rounded-lg bg-red-50 px-3 py-2 text-[11px] leading-4 text-destructive" role="alert">
                   {aiError}

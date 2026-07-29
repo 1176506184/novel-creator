@@ -44,6 +44,7 @@ function MainWindow() {
   const [isChoosingLibrary, setIsChoosingLibrary] = useState(false)
   const [isRefreshingLibrary, setIsRefreshingLibrary] = useState(false)
   const [isWriterDirty, setIsWriterDirty] = useState(false)
+  const [isWriterAiRunning, setIsWriterAiRunning] = useState(false)
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false)
   const [isSettingsDialogOpen, setIsSettingsDialogOpen] = useState(false)
   const [isStyleComparisonOpen, setIsStyleComparisonOpen] = useState(false)
@@ -79,6 +80,10 @@ function MainWindow() {
   async function selectProject(projectPath: string, openWriter = true) {
     const project = library.projects.find((item) => item.path === projectPath)
     if (!project) return
+    if (project.path !== activeProjectPath && isWriterAiRunning) {
+      window.alert("AI 写作助手正在运行，请先回到写作台停止当前任务，再切换小说。")
+      return
+    }
     if (
       project.path !== activeProjectPath
       && isWriterDirty
@@ -91,6 +96,10 @@ function MainWindow() {
   }
 
   async function chooseLibraryRoot() {
+    if (isWriterAiRunning) {
+      window.alert("AI 写作助手正在运行，请先回到写作台停止当前任务，再切换小说库。")
+      return
+    }
     if (isWriterDirty && !window.confirm("当前章节尚未保存，确定放弃修改并切换小说库吗？")) return
     setIsChoosingLibrary(true)
     try {
@@ -112,6 +121,10 @@ function MainWindow() {
   }
 
   async function renameProject(project: LibraryProject, nextName: string) {
+    if (project.path === activeProjectPath && isWriterAiRunning) {
+      window.alert("AI 写作助手正在运行，请先停止当前任务，再重命名这部作品。")
+      return
+    }
     if (
       project.path === activeProjectPath
       && isWriterDirty
@@ -125,6 +138,10 @@ function MainWindow() {
   }
 
   async function createProject(): Promise<CreateProjectResult | null> {
+    if (isWriterAiRunning) {
+      window.alert("AI 写作助手正在运行，请先回到写作台停止当前任务，再新建作品。")
+      return null
+    }
     const result = await window.authorDesk.library.createProject()
     if (!result) return null
     setLibrary(result.library)
@@ -232,7 +249,7 @@ function MainWindow() {
               variant="ghost"
               title="写作台"
               aria-label="写作台"
-              className={`h-10 w-full ${isSidebarCollapsed ? "justify-center px-0" : "justify-start"} ${
+              className={`relative h-10 w-full ${isSidebarCollapsed ? "justify-center px-0" : "justify-start"} ${
                 activePage === "writer" && !isSettingsDialogOpen && !isStyleComparisonOpen
                   ? "bg-secondary text-primary hover:bg-secondary"
                   : "text-muted-foreground"
@@ -246,6 +263,14 @@ function MainWindow() {
             >
               <PenLine className="size-4" />
               {!isSidebarCollapsed && "写作台"}
+              {isWriterAiRunning && (
+                <LoaderCircle
+                  className={`size-3.5 animate-spin text-primary ${
+                    isSidebarCollapsed ? "absolute right-1.5 top-1.5" : "ml-auto"
+                  }`}
+                  aria-label="AI 助手运行中"
+                />
+              )}
             </Button>
             <Button
               variant="ghost"
@@ -329,7 +354,7 @@ function MainWindow() {
         </aside>
 
         <section className="relative min-w-0 flex-1 overflow-hidden bg-canvas">
-          {activePage === "works" ? (
+          {activePage === "works" && (
             <div className="relative h-full overflow-auto">
               <WorksPage
                 library={library}
@@ -343,16 +368,22 @@ function MainWindow() {
                 onSelectProject={(project) => selectProject(project.path)}
               />
             </div>
-          ) : (
+          )}
+          <div
+            className={activePage === "writer" ? "h-full" : "hidden"}
+            aria-hidden={activePage !== "writer"}
+          >
             <WriterPage
               project={activeProject}
+              isActive={activePage === "writer"}
               onGoToWorks={showWorksPage}
               onOpenProjectFolder={openProjectFolder}
               onOpenSettings={showSettingsPage}
               onSaved={refreshLibrary}
               onDirtyChange={setIsWriterDirty}
+              onAiRunningChange={setIsWriterAiRunning}
             />
-          )}
+          </div>
         </section>
       </div>
 

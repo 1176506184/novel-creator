@@ -1,5 +1,6 @@
 const path = require("node:path")
 const fs = require("node:fs")
+const { randomUUID } = require("node:crypto")
 const { spawn } = require("node:child_process")
 const {
   app,
@@ -226,7 +227,7 @@ const AI_CHAT_TOOLS = [
     type: "function",
     function: {
       name: "create_file",
-      description: "在当前小说目录中创建新的文本文件。禁止覆盖同名文件。",
+      description: "准备在当前小说目录中创建新的文本文件。只生成待确认差异，不会立即写入；禁止覆盖同名文件。",
       parameters: {
         type: "object",
         properties: {
@@ -258,7 +259,7 @@ const AI_CHAT_TOOLS = [
     type: "function",
     function: {
       name: "modify_file",
-      description: "用精确文本替换修改当前小说目录中的文件，并返回实际 diff。",
+      description: "用精确文本替换准备修改当前小说目录中的文件，返回待确认 diff，用户保存后才真正写入。",
       parameters: {
         type: "object",
         properties: {
@@ -338,6 +339,164 @@ function createTextDiff(relativePath, beforeContent, afterContent) {
   return lines.join("\n").slice(0, 80_000)
 }
 
+function getAiPendingChangesDirectory(projectPath) {
+  if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) {
+    throw new Error("作品目录不在当前小说库中")
+  }
+  return path.join(path.resolve(projectPath), ".chat", "pending-changes")
+}
+
+function normalizeAiChangeSetId(changeSetIdInput) {
+  const changeSetId = String(changeSetIdInput || "").trim()
+  if (!/^[a-f0-9-]{36}$/i.test(changeSetId)) throw new Error("AI 修改记录无效")
+  return changeSetId
+}
+
+function getAiPendingChangePath(projectPath, changeSetIdInput) {
+  const changeSetId = normalizeAiChangeSetId(changeSetIdInput)
+  return path.join(getAiPendingChangesDirectory(projectPath), `${changeSetId}.json`)
+}
+
+async function findExistingAiTargetParent(targetPath) {
+  let currentPath = path.dirname(targetPath)
+  while (true) {
+    try {
+      return await fs.promises.realpath(currentPath)
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error
+      const parentPath = path.dirname(currentPath)
+      if (parentPath === currentPath) throw new Error("无法确认目标目录")
+      currentPath = parentPath
+    }
+  }
+}
+
+async function assertAiTargetParentInsideProject(realProjectPath, targetPath) {
+  const realParentPath = await findExistingAiTargetParent(targetPath)
+  if (realParentPath !== realProjectPath && !isPathContained(realProjectPath, realParentPath)) {
+    throw new Error("目标目录符号链接指向小说目录之外")
+  }
+}
+
+async function saveAiPendingChangeSet(projectPath, pendingChanges) {
+  if (!(pendingChanges instanceof Map) || pendingChanges.size === 0) return ""
+  const changeSetId = randomUUID()
+  const changeSetPath = getAiPendingChangePath(projectPath, changeSetId)
+  const changes = [...pendingChanges.values()].map((change) => ({
+    kind: change.kind,
+    path: change.path,
+    beforeContent: change.beforeContent,
+    afterContent: change.afterContent,
+  }))
+  await fs.promises.mkdir(path.dirname(changeSetPath), { recursive: true })
+  await fs.promises.writeFile(changeSetPath, `${JSON.stringify({
+    version: 1,
+    id: changeSetId,
+    createdAt: new Date().toISOString(),
+    changes,
+  }, null, 2)}\n`, { encoding: "utf8", flag: "wx" })
+  return changeSetId
+}
+
+async function readAiPendingChangeSet(projectPath, changeSetIdInput) {
+  const changeSetId = normalizeAiChangeSetId(changeSetIdInput)
+  const changeSetPath = getAiPendingChangePath(projectPath, changeSetId)
+  let data
+  try {
+    data = JSON.parse(await fs.promises.readFile(changeSetPath, "utf8"))
+  } catch (error) {
+    if (error?.code === "ENOENT") throw new Error("这组待确认修改已经不存在，可能已保存或取消")
+    throw new Error(`无法读取待确认修改：${error instanceof Error ? error.message : String(error)}`)
+  }
+  if (data?.id !== changeSetId || !Array.isArray(data?.changes) || !data.changes.length) {
+    throw new Error("待确认修改文件格式无效")
+  }
+  const changes = data.changes.map((change) => {
+    const kind = String(change?.kind || "")
+    if (!["created", "modified"].includes(kind)) throw new Error("待确认修改类型无效")
+    const { relativePath } = resolveAiProjectFile(projectPath, change?.path)
+    return {
+      kind,
+      path: relativePath,
+      beforeContent: String(change?.beforeContent || ""),
+      afterContent: String(change?.afterContent || ""),
+    }
+  })
+  return { changeSetId, changeSetPath, changes }
+}
+
+async function applyAiPendingChangeSet(projectPath, changeSetIdInput) {
+  const pending = await readAiPendingChangeSet(projectPath, changeSetIdInput)
+  const realProjectPath = await fs.promises.realpath(projectPath)
+  const validatedChanges = []
+
+  for (const change of pending.changes) {
+    const { targetPath, relativePath } = resolveAiProjectFile(projectPath, change.path)
+    if (change.kind === "created") {
+      await assertAiTargetParentInsideProject(realProjectPath, targetPath)
+      try {
+        await fs.promises.lstat(targetPath)
+        throw new Error(`“${relativePath}”已经存在，未执行覆盖`)
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error
+      }
+      validatedChanges.push({ ...change, targetPath, relativePath })
+      continue
+    }
+
+    const realTargetPath = await fs.promises.realpath(targetPath)
+    if (!isPathContained(realProjectPath, realTargetPath)) {
+      throw new Error(`“${relativePath}”符号链接指向小说目录之外`)
+    }
+    const currentContent = await readAiTextFile(realTargetPath)
+    if (currentContent !== change.beforeContent) {
+      throw new Error(`“${relativePath}”在 AI 生成差异后又发生了变化，请取消本次修改后重新生成`)
+    }
+    validatedChanges.push({
+      ...change,
+      targetPath: realTargetPath,
+      relativePath,
+    })
+  }
+
+  for (const change of validatedChanges) {
+    if (change.kind === "created") {
+      await fs.promises.mkdir(path.dirname(change.targetPath), { recursive: true })
+      const realParentPath = await fs.promises.realpath(path.dirname(change.targetPath))
+      if (realParentPath !== realProjectPath && !isPathContained(realProjectPath, realParentPath)) {
+        throw new Error(`“${change.relativePath}”目标目录符号链接指向小说目录之外`)
+      }
+      await fs.promises.writeFile(change.targetPath, change.afterContent, {
+        encoding: "utf8",
+        flag: "wx",
+      })
+    } else {
+      await fs.promises.writeFile(change.targetPath, change.afterContent, "utf8")
+    }
+  }
+
+  await fs.promises.unlink(pending.changeSetPath)
+  return {
+    ok: true,
+    appliedCount: validatedChanges.length,
+    toolEvents: validatedChanges.map((change) => ({
+      kind: change.kind,
+      path: change.relativePath,
+      label: change.kind === "created" ? "已创建文件" : "已修改文件",
+      diff: createTextDiff(change.relativePath, change.beforeContent, change.afterContent),
+    })),
+  }
+}
+
+async function discardAiPendingChangeSet(projectPath, changeSetIdInput) {
+  const pending = await readAiPendingChangeSet(projectPath, changeSetIdInput)
+  await fs.promises.unlink(pending.changeSetPath)
+  return {
+    ok: true,
+    discardedCount: pending.changes.length,
+  }
+}
+
 async function executeAiFileTool(toolName, args, toolContext) {
   const realProjectPath = await fs.promises.realpath(toolContext.projectPath)
 
@@ -392,11 +551,17 @@ async function executeAiFileTool(toolName, args, toolContext) {
         toolContext.projectPath,
         requestedPath,
       )
-      const realTargetPath = await fs.promises.realpath(targetPath)
-      if (!isPathContained(realProjectPath, realTargetPath)) {
-        throw new Error(`章节符号链接指向小说目录之外：${relativePath}`)
+      const stagedChange = toolContext.pendingChanges.get(relativePath)
+      let content
+      if (stagedChange) {
+        content = stagedChange.afterContent
+      } else {
+        const realTargetPath = await fs.promises.realpath(targetPath)
+        if (!isPathContained(realProjectPath, realTargetPath)) {
+          throw new Error(`章节符号链接指向小说目录之外：${relativePath}`)
+        }
+        content = await readAiTextFile(realTargetPath)
       }
-      const content = await readAiTextFile(realTargetPath)
       const remainingCharacters = Math.max(0, 240_000 - totalCharacters)
       if (!remainingCharacters) break
       const includedContent = content.slice(0, Math.min(60_000, remainingCharacters))
@@ -425,9 +590,15 @@ async function executeAiFileTool(toolName, args, toolContext) {
   const { targetPath, relativePath } = resolveAiProjectFile(toolContext.projectPath, args.path)
 
   if (toolName === "read_file") {
-    const realTargetPath = await fs.promises.realpath(targetPath)
-    if (!isPathContained(realProjectPath, realTargetPath)) throw new Error("文件符号链接指向小说目录之外")
-    const content = await readAiTextFile(realTargetPath)
+    const stagedChange = toolContext.pendingChanges.get(relativePath)
+    let content
+    if (stagedChange) {
+      content = stagedChange.afterContent
+    } else {
+      const realTargetPath = await fs.promises.realpath(targetPath)
+      if (!isPathContained(realProjectPath, realTargetPath)) throw new Error("文件符号链接指向小说目录之外")
+      content = await readAiTextFile(realTargetPath)
+    }
     return {
       result: { ok: true, path: relativePath, content: content.slice(0, 120_000) },
       event: { kind: "read", path: relativePath, label: "已读取文件" },
@@ -435,9 +606,15 @@ async function executeAiFileTool(toolName, args, toolContext) {
   }
 
   if (toolName === "preview_file_diff") {
-    const realTargetPath = await fs.promises.realpath(targetPath)
-    if (!isPathContained(realProjectPath, realTargetPath)) throw new Error("文件符号链接指向小说目录之外")
-    const beforeContent = await readAiTextFile(realTargetPath)
+    const stagedChange = toolContext.pendingChanges.get(relativePath)
+    let beforeContent
+    if (stagedChange) {
+      beforeContent = stagedChange.afterContent
+    } else {
+      const realTargetPath = await fs.promises.realpath(targetPath)
+      if (!isPathContained(realProjectPath, realTargetPath)) throw new Error("文件符号链接指向小说目录之外")
+      beforeContent = await readAiTextFile(realTargetPath)
+    }
     const afterContent = String(args.new_content || "")
     if (afterContent.length > 500_000) throw new Error("拟写入内容超过 500,000 字符")
     const diff = createTextDiff(relativePath, beforeContent, afterContent)
@@ -455,21 +632,30 @@ async function executeAiFileTool(toolName, args, toolContext) {
   if (toolName === "create_file") {
     const content = String(args.content || "")
     if (content.length > 500_000) throw new Error("新文件内容超过 500,000 字符")
-    await fs.promises.mkdir(path.dirname(targetPath), { recursive: true })
-    const realParentPath = await fs.promises.realpath(path.dirname(targetPath))
-    if (!isPathContained(realProjectPath, realParentPath) && realParentPath !== realProjectPath) {
-      throw new Error("目标目录符号链接指向小说目录之外")
-    }
+    if (toolContext.pendingChanges.has(relativePath)) throw new Error("同名文件已经在待确认修改中")
+    await assertAiTargetParentInsideProject(realProjectPath, targetPath)
     try {
-      await fs.promises.writeFile(targetPath, content, { encoding: "utf8", flag: "wx" })
+      await fs.promises.lstat(targetPath)
+      throw new Error("同名文件已经存在，未执行覆盖")
     } catch (error) {
-      if (error.code === "EEXIST") throw new Error("同名文件已经存在，未执行覆盖")
-      throw error
+      if (error?.code !== "ENOENT") throw error
     }
     const diff = createTextDiff(relativePath, "", content)
+    toolContext.pendingChanges.set(relativePath, {
+      kind: "created",
+      path: relativePath,
+      beforeContent: "",
+      afterContent: content,
+    })
     return {
-      result: { ok: true, path: relativePath, diff },
-      event: { kind: "created", path: relativePath, label: "已创建文件", diff },
+      result: {
+        ok: true,
+        staged: true,
+        requires_confirmation: true,
+        path: relativePath,
+        diff,
+      },
+      event: { kind: "created", path: relativePath, label: "等待确认创建", diff },
     }
   }
 
@@ -480,18 +666,42 @@ async function executeAiFileTool(toolName, args, toolContext) {
     const oldText = String(args.old_text || "")
     const newText = String(args.new_text || "")
     if (!oldText) throw new Error("old_text 不能为空")
-    const realTargetPath = await fs.promises.realpath(targetPath)
-    if (!isPathContained(realProjectPath, realTargetPath)) throw new Error("文件符号链接指向小说目录之外")
-    const beforeContent = await readAiTextFile(realTargetPath)
+    const existingChange = toolContext.pendingChanges.get(relativePath)
+    let beforeContent
+    if (existingChange) {
+      beforeContent = existingChange.afterContent
+    } else {
+      const realTargetPath = await fs.promises.realpath(targetPath)
+      if (!isPathContained(realProjectPath, realTargetPath)) throw new Error("文件符号链接指向小说目录之外")
+      beforeContent = await readAiTextFile(realTargetPath)
+    }
     if (!beforeContent.includes(oldText)) throw new Error("文件中找不到需要替换的精确原文")
     const afterContent = args.replace_all === true
       ? beforeContent.split(oldText).join(newText)
       : beforeContent.replace(oldText, newText)
-    const diff = createTextDiff(relativePath, beforeContent, afterContent)
-    await fs.promises.writeFile(realTargetPath, afterContent, "utf8")
+    const originalContent = existingChange?.beforeContent ?? beforeContent
+    const changeKind = existingChange?.kind ?? "modified"
+    const diff = createTextDiff(relativePath, originalContent, afterContent)
+    toolContext.pendingChanges.set(relativePath, {
+      kind: changeKind,
+      path: relativePath,
+      beforeContent: originalContent,
+      afterContent,
+    })
     return {
-      result: { ok: true, path: relativePath, diff },
-      event: { kind: "modified", path: relativePath, label: "已修改文件", diff },
+      result: {
+        ok: true,
+        staged: true,
+        requires_confirmation: true,
+        path: relativePath,
+        diff,
+      },
+      event: {
+        kind: changeKind,
+        path: relativePath,
+        label: changeKind === "created" ? "等待确认创建" : "等待确认修改",
+        diff,
+      },
     }
   }
 
@@ -622,9 +832,9 @@ const AI_TOOL_PROGRESS_LABELS = {
   list_chapters: "正在读取章节目录…",
   read_chapters: "正在批量读取章节…",
   read_file: "正在读取作品文件…",
-  create_file: "正在创建作品文件…",
+  create_file: "正在准备新文件…",
   preview_file_diff: "正在生成修改差异…",
-  modify_file: "正在修改作品文件…",
+  modify_file: "正在准备文件修改…",
 }
 
 const AI_MAX_RETRIES = 5
@@ -634,6 +844,35 @@ const AI_CHAT_HISTORY_LIMIT = 100
 const AI_CHAT_COMPACT_MESSAGE_THRESHOLD = 32
 const AI_CHAT_COMPACT_CHARACTER_THRESHOLD = 60_000
 const AI_CHAT_RECENT_MESSAGE_COUNT = 16
+const AI_CHAT_TOOL_ROUND_LIMIT = 12
+const AI_CHAT_SOFT_REVIEW_ROUND = 8
+const AI_CHAT_DUPLICATE_TOOL_LIMIT = 3
+const activeAiChatControllers = new Map()
+
+function createAiRequestCanceledError() {
+  const error = new Error("AI 请求已由用户停止")
+  error.name = "AiRequestCanceledError"
+  error.code = "AI_REQUEST_CANCELED"
+  return error
+}
+
+function throwIfAiRequestCanceled(signal) {
+  if (signal?.aborted) throw createAiRequestCanceledError()
+}
+
+function stableAiToolValue(value) {
+  if (Array.isArray(value)) return value.map(stableAiToolValue)
+  if (!value || typeof value !== "object") return value
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, stableAiToolValue(value[key])]),
+  )
+}
+
+function createAiToolCallSignature(toolName, args) {
+  return `${toolName}:${JSON.stringify(stableAiToolValue(args))}`
+}
 
 function isRetryableAiError(error) {
   const httpStatus = Number(error?.httpStatus)
@@ -657,8 +896,21 @@ function describeAiRetryReason(error) {
   return "网络连接中断"
 }
 
-function waitForAiRetry(delayMs) {
-  return new Promise((resolve) => setTimeout(resolve, delayMs))
+function waitForAiRetry(delayMs, signal) {
+  throwIfAiRequestCanceled(signal)
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, delayMs))
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", handleAbort)
+      resolve()
+    }, delayMs)
+    function handleAbort() {
+      clearTimeout(timer)
+      reject(createAiRequestCanceledError())
+    }
+    signal.addEventListener("abort", handleAbort, { once: true })
+  })
 }
 
 function getAiChatHistoryPath(projectPath) {
@@ -698,7 +950,17 @@ function normalizeAiHistoryMessages(messages) {
         ? message.toolEvents.map(normalizeAiToolEvent).filter(Boolean).slice(0, 50)
         : []
       if (toolEvents.length) normalized.toolEvents = toolEvents
+      const status = typeof message.status === "string"
+        ? message.status.trim().slice(0, 100)
+        : ""
+      if (status) normalized.status = status
       if (message.hasError === true) normalized.hasError = true
+      const changeSetId = String(message.changeSetId || "").trim()
+      if (/^[a-f0-9-]{36}$/i.test(changeSetId)) normalized.changeSetId = changeSetId
+      const changeStatus = String(message.changeStatus || "")
+      if (["pending", "saved", "canceled"].includes(changeStatus)) {
+        normalized.changeStatus = changeStatus
+      }
       return normalized
     })
     .filter(Boolean)
@@ -773,9 +1035,15 @@ async function requestAiCompletionWithRetry({
   config,
   body,
   onProgress,
+  signal,
 }) {
   for (let attempt = 0; attempt <= AI_MAX_RETRIES; attempt += 1) {
+    throwIfAiRequestCanceled(signal)
     try {
+      const timeoutSignal = AbortSignal.timeout(300_000)
+      const requestSignal = signal && typeof AbortSignal.any === "function"
+        ? AbortSignal.any([signal, timeoutSignal])
+        : signal || timeoutSignal
       const response = await fetch(endpoint, {
         method: "POST",
         headers: {
@@ -783,10 +1051,13 @@ async function requestAiCompletionWithRetry({
           "Content-Type": "application/json",
         },
         body,
-        signal: AbortSignal.timeout(300_000),
+        signal: requestSignal,
       })
       return await readAiCompletionResponse(response, onProgress)
     } catch (error) {
+      if (signal?.aborted || error?.code === "AI_REQUEST_CANCELED") {
+        throw createAiRequestCanceledError()
+      }
       if (!isRetryableAiError(error) || attempt >= AI_MAX_RETRIES) throw error
 
       const retryNumber = attempt + 1
@@ -796,7 +1067,7 @@ async function requestAiCompletionWithRetry({
         type: "status",
         label: `${describeAiRetryReason(error)}，${Math.ceil(delayMs / 1000)} 秒后进行第 ${retryNumber}/${AI_MAX_RETRIES} 次重试…`,
       })
-      await waitForAiRetry(delayMs)
+      await waitForAiRetry(delayMs, signal)
       onProgress({
         type: "status",
         label: `正在进行第 ${retryNumber}/${AI_MAX_RETRIES} 次重试…`,
@@ -879,7 +1150,8 @@ async function compactAiChatHistory(projectPath) {
   }
 }
 
-async function requestAiChat(input, onProgress = () => {}) {
+async function requestAiChat(input, onProgress = () => {}, signal) {
+  throwIfAiRequestCanceled(signal)
   if (!input || typeof input !== "object") throw new Error("AI 对话参数无效")
   const messages = Array.isArray(input.messages)
     ? input.messages
@@ -925,7 +1197,8 @@ async function requestAiChat(input, onProgress = () => {}) {
         "你可以协助续写、润色、剧情分析、人物一致性检查，并可使用工具读取、创建或修改当前小说中的文本文件。",
         "分析多个章节时，先调用 list_chapters 获取准确目录，再使用 read_chapters 一次批量读取相关章节；不要逐章反复调用 read_file。",
         "只有用户明确要求创建或修改文件时，才可调用 create_file 或 modify_file。",
-        "修改文件前应先读取文件并使用 preview_file_diff 检查拟议变化；所有修改都要在最终回答中说明。",
+        "修改文件前应先读取文件并使用 preview_file_diff 检查拟议变化；所有写操作只会暂存，必须由用户查看差异并点击保存后才真正写入。",
+        "工具返回 staged=true 时，只能称为“已准备修改”或“等待用户确认”，不得声称文件已经保存。",
         "不得删除文件，不得访问当前小说目录之外的路径。",
         "回答和续写正文时直接输出清晰段落，不要把每一行写成 Markdown 引用块，不要反复使用行首符号 >。",
         "默认使用中文回答，除非用户明确要求其他语言。",
@@ -960,8 +1233,77 @@ async function requestAiChat(input, onProgress = () => {}) {
   ]
   const toolEvents = []
   const previewedPaths = new Set()
+  const pendingChanges = new Map()
+  const executedToolCallSignatures = new Set()
+  let duplicateToolCallCount = 0
+  let didAddSoftReviewPrompt = false
 
-  for (let round = 0; round < 12; round += 1) {
+  async function createAiChatResult(content, autoReviewed) {
+    const pendingPaths = new Set(pendingChanges.keys())
+    const finalToolEvents = toolEvents.filter((event) => (
+      !pendingPaths.has(event.path) || event.kind === "read"
+    ))
+    for (const change of pendingChanges.values()) {
+      finalToolEvents.push({
+        kind: change.kind,
+        path: change.path,
+        label: change.kind === "created" ? "等待确认创建" : "等待确认修改",
+        diff: createTextDiff(change.path, change.beforeContent, change.afterContent),
+      })
+    }
+    const changeSetId = await saveAiPendingChangeSet(projectPath, pendingChanges)
+    return {
+      content,
+      model: config.model,
+      toolEvents: finalToolEvents,
+      autoReviewed,
+      changeSetId,
+      pendingChangeCount: pendingChanges.size,
+    }
+  }
+
+  async function finalizeWithAutomaticReview(reason) {
+    throwIfAiRequestCanceled(signal)
+    onProgress({
+      type: "status",
+      label: "工具调用已收束，正在自动审核并整理结果…",
+    })
+    apiMessages.push({
+      role: "system",
+      content: [
+        "现在必须停止调用任何工具，并对本次任务进行最终审核与答复。",
+        `收束原因：${reason}`,
+        "请依据当前对话和已有工具结果完成以下工作：",
+        "1. 核对已经读取、创建或修改的内容，不要把未完成的操作说成已完成。",
+        "2. 如果证据足够，直接给出完整结论或可用的写作结果。",
+        "3. 如果证据不足，保留已得到的结论，并明确列出仍缺少的章节、文件或信息。",
+        "4. 任务范围过大时，给出下一步最合适的拆分建议，请用户确认后继续。",
+        "不要再请求调用工具，不要只回复错误提示。",
+      ].join("\n"),
+    })
+    const reviewedMessage = await requestAiCompletionWithRetry({
+      endpoint,
+      config,
+      onProgress,
+      signal,
+      body: JSON.stringify({
+        model: config.model,
+        reasoning_effort: config.reasoningEffort,
+        messages: apiMessages,
+        max_tokens: 4096,
+        stream: true,
+      }),
+    })
+    const reviewedContent = reviewedMessage?.content
+    if (typeof reviewedContent !== "string" || !reviewedContent.trim()) {
+      throw new Error("AI 自动审核没有返回有效内容")
+    }
+    onProgress({ type: "status", label: "已自动审核并收束" })
+    return createAiChatResult(reviewedContent.trim(), true)
+  }
+
+  for (let round = 0; round < AI_CHAT_TOOL_ROUND_LIMIT; round += 1) {
+    throwIfAiRequestCanceled(signal)
     onProgress({
       type: "status",
       label: round === 0 ? "正在理解你的问题…" : "正在整理工具结果…",
@@ -970,6 +1312,7 @@ async function requestAiChat(input, onProgress = () => {}) {
       endpoint,
       config,
       onProgress,
+      signal,
       body: JSON.stringify({
         model: config.model,
         reasoning_effort: config.reasoningEffort,
@@ -981,6 +1324,7 @@ async function requestAiChat(input, onProgress = () => {}) {
         stream: true,
       }),
     })
+    throwIfAiRequestCanceled(signal)
     const toolCalls = Array.isArray(assistantMessage?.tool_calls)
       ? assistantMessage.tool_calls.slice(0, 8)
       : []
@@ -988,7 +1332,7 @@ async function requestAiChat(input, onProgress = () => {}) {
       const content = assistantMessage?.content
       if (typeof content !== "string" || !content.trim()) throw new Error("AI 没有返回有效内容")
       onProgress({ type: "status", label: "回复完成" })
-      return { content: content.trim(), model: config.model, toolEvents }
+      return createAiChatResult(content.trim(), false)
     }
 
     apiMessages.push({
@@ -996,7 +1340,9 @@ async function requestAiChat(input, onProgress = () => {}) {
       content: typeof assistantMessage.content === "string" ? assistantMessage.content : "",
       tool_calls: toolCalls,
     })
+    let shouldForceReviewAfterRound = false
     for (const toolCall of toolCalls) {
+      throwIfAiRequestCanceled(signal)
       const toolName = String(toolCall?.function?.name || "")
       onProgress({
         type: "status",
@@ -1008,11 +1354,46 @@ async function requestAiChat(input, onProgress = () => {}) {
       } catch {
         args = {}
       }
+      if (shouldForceReviewAfterRound) {
+        apiMessages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify({
+            ok: false,
+            skipped: true,
+            reason: "本轮已触发自动审核收束，剩余工具调用不再执行。",
+          }),
+        })
+        continue
+      }
+      const toolCallSignature = createAiToolCallSignature(toolName, args)
+      if (executedToolCallSignatures.has(toolCallSignature)) {
+        duplicateToolCallCount += 1
+        onProgress({
+          type: "status",
+          label: `已跳过重复工具调用（${duplicateToolCallCount}/${AI_CHAT_DUPLICATE_TOOL_LIMIT}）…`,
+        })
+        apiMessages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify({
+            ok: false,
+            skipped: true,
+            reason: "相同工具和参数已经执行过，请使用已有结果，不要重复调用。",
+          }),
+        })
+        if (duplicateToolCallCount >= AI_CHAT_DUPLICATE_TOOL_LIMIT) {
+          shouldForceReviewAfterRound = true
+        }
+        continue
+      }
+      executedToolCallSignatures.add(toolCallSignature)
       try {
         const execution = await executeAiFileTool(toolName, args, {
           projectPath,
           allowWriteTools: input.allowWriteTools === true,
           previewedPaths,
+          pendingChanges,
         })
         toolEvents.push(execution.event)
         onProgress({ type: "tool-event", toolEvent: execution.event })
@@ -1021,7 +1402,11 @@ async function requestAiChat(input, onProgress = () => {}) {
           tool_call_id: toolCall.id,
           content: JSON.stringify(execution.result),
         })
+        throwIfAiRequestCanceled(signal)
       } catch (toolError) {
+        if (signal?.aborted || toolError?.code === "AI_REQUEST_CANCELED") {
+          throw createAiRequestCanceledError()
+        }
         onProgress({
           type: "status",
           label: `工具调用失败：${toolError instanceof Error ? toolError.message : String(toolError)}`,
@@ -1036,8 +1421,36 @@ async function requestAiChat(input, onProgress = () => {}) {
         })
       }
     }
+
+    if (shouldForceReviewAfterRound) {
+      return finalizeWithAutomaticReview("检测到多次重复工具调用")
+    }
+
+    const completedRound = round + 1
+    if (
+      !didAddSoftReviewPrompt
+      && completedRound >= AI_CHAT_SOFT_REVIEW_ROUND
+    ) {
+      didAddSoftReviewPrompt = true
+      const remainingRounds = AI_CHAT_TOOL_ROUND_LIMIT - completedRound
+      apiMessages.push({
+        role: "system",
+        content: [
+          `你已经使用了 ${completedRound} 轮工具调用，最多还剩 ${remainingRounds} 轮。`,
+          "继续前请先自检：现有信息是否已经足以回答用户。",
+          "如果足够，下一轮必须直接给出最终答复，不要再调用工具。",
+          "只有明确缺少关键证据时才能继续调用工具，并且不得重复读取已有结果。",
+        ].join("\n"),
+      })
+      onProgress({
+        type: "status",
+        label: `已使用 ${completedRound}/${AI_CHAT_TOOL_ROUND_LIMIT} 轮工具，正在自检是否可以收束…`,
+      })
+    }
   }
-  throw new Error("AI 已连续调用 12 轮工具但仍未完成，请减少一次需要分析的章节数量后重试")
+  return finalizeWithAutomaticReview(
+    `已达到 ${AI_CHAT_TOOL_ROUND_LIMIT} 轮工具调用上限`,
+  )
 }
 
 function characterGraphServicePath(projectPath) {
@@ -2953,16 +3366,44 @@ ipcMain.handle("settings:get-api", () => getApiConfig())
 
 ipcMain.handle("settings:save-api", (_event, input) => saveApiConfig(input))
 
-ipcMain.handle("ai:chat", (event, input) => {
+ipcMain.handle("ai:chat", async (event, input) => {
   const requestId = String(input?.requestId || "")
-  return requestAiChat(input, (progress) => {
-    if (event.sender.isDestroyed()) return
-    event.sender.send("ai:chat-progress", {
-      requestId,
-      ...progress,
-    })
-  })
+  if (!requestId) throw new Error("AI 请求 ID 无效")
+  const requestKey = `${event.sender.id}:${requestId}`
+  const controller = new AbortController()
+  activeAiChatControllers.set(requestKey, controller)
+  try {
+    return await requestAiChat(input, (progress) => {
+      if (event.sender.isDestroyed()) return
+      event.sender.send("ai:chat-progress", {
+        requestId,
+        ...progress,
+      })
+    }, controller.signal)
+  } finally {
+    if (activeAiChatControllers.get(requestKey) === controller) {
+      activeAiChatControllers.delete(requestKey)
+    }
+  }
 })
+
+ipcMain.handle("ai:cancel-chat", (event, requestIdInput) => {
+  const requestId = String(requestIdInput || "")
+  if (!requestId) return false
+  const requestKey = `${event.sender.id}:${requestId}`
+  const controller = activeAiChatControllers.get(requestKey)
+  if (!controller) return false
+  controller.abort(createAiRequestCanceledError())
+  return true
+})
+
+ipcMain.handle("ai:apply-changes", (_event, projectPath, changeSetId) => (
+  applyAiPendingChangeSet(projectPath, changeSetId)
+))
+
+ipcMain.handle("ai:discard-changes", (_event, projectPath, changeSetId) => (
+  discardAiPendingChangeSet(projectPath, changeSetId)
+))
 
 ipcMain.handle("ai:get-history", (_event, projectPath) => getAiChatHistory(projectPath))
 

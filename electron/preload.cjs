@@ -65,6 +65,13 @@ contextBridge.exposeInMainWorld("authorDesk", {
   },
   ai: {
     chat: (input) => ipcRenderer.invoke("ai:chat", input),
+    cancelChat: (requestId) => ipcRenderer.invoke("ai:cancel-chat", requestId),
+    applyChanges: (projectPath, changeSetId) => (
+      ipcRenderer.invoke("ai:apply-changes", projectPath, changeSetId)
+    ),
+    discardChanges: (projectPath, changeSetId) => (
+      ipcRenderer.invoke("ai:discard-changes", projectPath, changeSetId)
+    ),
     getHistory: (projectPath) => ipcRenderer.invoke("ai:get-history", projectPath),
     saveHistory: (projectPath, messages) => (
       ipcRenderer.invoke("ai:save-history", projectPath, messages)

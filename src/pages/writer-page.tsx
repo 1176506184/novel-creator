@@ -13,6 +13,7 @@ import {
   Bot,
   BrainCircuit,
   Check,
+  ChevronDown,
   CircleAlert,
   CloudUpload,
   Copy,
@@ -26,6 +27,7 @@ import {
   Search,
   Send,
   Settings2,
+  Square,
   ScrollText,
   Sparkles,
   TriangleAlert,
@@ -48,10 +50,12 @@ import type {
 
 type WriterPageProps = {
   project: LibraryProject | null
+  isActive: boolean
   onGoToWorks: () => void
   onOpenProjectFolder: (project: LibraryProject) => void
   onSaved: () => void
   onDirtyChange: (isDirty: boolean) => void
+  onAiRunningChange: (isRunning: boolean) => void
   onOpenSettings: () => void
 }
 
@@ -70,6 +74,8 @@ type AiMessage = {
   isStreaming?: boolean
   status?: string
   hasError?: boolean
+  changeSetId?: string
+  changeStatus?: "pending" | "saved" | "canceled"
 }
 
 type ChapterContextMenu = {
@@ -104,6 +110,11 @@ function formatAiChatError(error: unknown) {
   return message || "AI 请求失败"
 }
 
+function isAiChatCanceledError(error: unknown) {
+  const rawMessage = error instanceof Error ? error.message : String(error || "")
+  return /AI_REQUEST_CANCELED|AiRequestCanceledError|AI 请求已由用户停止/i.test(rawMessage)
+}
+
 function formatGitSyncError(error: unknown) {
   const rawMessage = error instanceof Error ? error.message : String(error || "")
   const message = rawMessage
@@ -134,12 +145,175 @@ function formatAiDisplayContent(content: string) {
     .replace(/\n{3,}/g, "\n\n")
 }
 
+type ParsedAiDiffLine = {
+  kind: "header" | "hunk" | "removed" | "added" | "context" | "meta"
+  content: string
+  oldLine: number | null
+  newLine: number | null
+}
+
+function parseAiDiff(diff: string) {
+  let oldLine: number | null = null
+  let newLine: number | null = null
+  let additions = 0
+  let removals = 0
+
+  const lines: ParsedAiDiffLine[] = diff.split(/\r?\n/).map((line) => {
+    if (line.startsWith("--- ") || line.startsWith("+++ ")) {
+      return { kind: "header", content: line, oldLine: null, newLine: null }
+    }
+
+    if (line.startsWith("@@")) {
+      const range = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+      oldLine = range ? Number(range[1]) : null
+      newLine = range ? Number(range[2]) : null
+      return { kind: "hunk", content: line, oldLine: null, newLine: null }
+    }
+
+    if (line.startsWith("-")) {
+      const currentOldLine = oldLine
+      if (oldLine !== null) oldLine += 1
+      removals += 1
+      return {
+        kind: "removed",
+        content: line.slice(1),
+        oldLine: currentOldLine,
+        newLine: null,
+      }
+    }
+
+    if (line.startsWith("+")) {
+      const currentNewLine = newLine
+      if (newLine !== null) newLine += 1
+      additions += 1
+      return {
+        kind: "added",
+        content: line.slice(1),
+        oldLine: null,
+        newLine: currentNewLine,
+      }
+    }
+
+    if (line.startsWith("\\")) {
+      return { kind: "meta", content: line, oldLine: null, newLine: null }
+    }
+
+    const currentOldLine = oldLine
+    const currentNewLine = newLine
+    if (oldLine !== null) oldLine += 1
+    if (newLine !== null) newLine += 1
+    return {
+      kind: "context",
+      content: line.startsWith(" ") ? line.slice(1) : line,
+      oldLine: currentOldLine,
+      newLine: currentNewLine,
+    }
+  })
+
+  return { lines, additions, removals }
+}
+
+function getVisibleAiToolEvents(toolEvents: AiToolEvent[] = []) {
+  return toolEvents.filter((toolEvent, index) => {
+    if (toolEvent.kind !== "diff") return true
+    return !toolEvents.slice(index + 1).some((laterEvent) => (
+      laterEvent.path === toolEvent.path
+      && (laterEvent.kind === "modified" || laterEvent.kind === "created")
+    ))
+  })
+}
+
+function AiDiffView({ diff }: { diff: string }) {
+  const parsed = useMemo(() => parseAiDiff(diff), [diff])
+
+  return (
+    <div className="border-t border-border bg-white">
+      <div className="flex min-h-9 items-center gap-2 border-b border-border bg-muted/20 px-2.5 py-1.5">
+        <span className="text-[10px] font-medium text-muted-foreground">具体差异</span>
+        <span className="rounded-md bg-red-50 px-1.5 py-0.5 text-[10px] font-semibold text-red-700">
+          修改前 -{parsed.removals}
+        </span>
+        <span className="rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">
+          修改后 +{parsed.additions}
+        </span>
+        <button
+          type="button"
+          className="ml-auto grid size-6 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+          aria-label="复制完整 diff"
+          title="复制完整 diff"
+          onClick={() => navigator.clipboard.writeText(diff)}
+        >
+          <Copy className="size-3" />
+        </button>
+      </div>
+
+      <div className="max-h-72 overflow-auto bg-[#fffdfc] font-mono text-[10px] leading-4 select-text">
+        <div className="sticky top-0 z-10 grid min-w-max grid-cols-[36px_36px_20px_minmax(220px,1fr)] border-b border-border bg-[#f7f7f6] text-[9px] font-medium text-muted-foreground">
+          <span className="border-r border-border/70 px-1 py-1 text-right" title="修改前行号">旧</span>
+          <span className="border-r border-border/70 px-1 py-1 text-right" title="修改后行号">新</span>
+          <span />
+          <span className="px-2 py-1">内容</span>
+        </div>
+        {parsed.lines.map((line, index) => {
+          const rowClass = line.kind === "removed"
+            ? "bg-red-50/90 text-red-900"
+            : line.kind === "added"
+              ? "bg-emerald-50/90 text-emerald-900"
+              : line.kind === "hunk"
+                ? "bg-blue-50 text-blue-700"
+                : line.kind === "header"
+                  ? "bg-muted/35 font-semibold text-muted-foreground"
+                  : line.kind === "meta"
+                    ? "bg-amber-50 text-amber-700"
+                    : "text-foreground/80"
+          const marker = line.kind === "removed"
+            ? "-"
+            : line.kind === "added"
+              ? "+"
+              : line.kind === "context"
+                ? " "
+                : ""
+
+          return (
+            <div
+              key={`${index}-${line.kind}`}
+              className={`grid min-w-max grid-cols-[36px_36px_20px_minmax(220px,1fr)] ${rowClass}`}
+            >
+              <span className="border-r border-border/45 px-1 py-0.5 text-right text-muted-foreground/75">
+                {line.oldLine ?? ""}
+              </span>
+              <span className="border-r border-border/45 px-1 py-0.5 text-right text-muted-foreground/75">
+                {line.newLine ?? ""}
+              </span>
+              <span
+                className={`py-0.5 text-center font-bold ${
+                  line.kind === "removed"
+                    ? "text-red-600"
+                    : line.kind === "added"
+                      ? "text-emerald-600"
+                      : "text-muted-foreground"
+                }`}
+                aria-hidden="true"
+              >
+                {marker}
+              </span>
+              <code className="block min-w-max whitespace-pre px-2 py-0.5">{line.content || " "}</code>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 export function WriterPage({
   project,
+  isActive,
   onGoToWorks,
   onOpenProjectFolder,
   onSaved,
   onDirtyChange,
+  onAiRunningChange,
   onOpenSettings,
 }: WriterPageProps) {
   const [chapters, setChapters] = useState<ChapterSummary[]>([])
@@ -168,6 +342,9 @@ export function WriterPage({
   const [aiInput, setAiInput] = useState("")
   const [aiError, setAiError] = useState("")
   const [isAiThinking, setIsAiThinking] = useState(false)
+  const [isAiStopping, setIsAiStopping] = useState(false)
+  const [activeAiChangeSetId, setActiveAiChangeSetId] = useState("")
+  const [activeAiChangeAction, setActiveAiChangeAction] = useState<"save" | "cancel" | "">("")
   const [isAiHistoryLoading, setIsAiHistoryLoading] = useState(false)
   const [isAiCompacting, setIsAiCompacting] = useState(false)
   const [aiToolSyncEvent, setAiToolSyncEvent] = useState<AiToolSyncEvent | null>(null)
@@ -189,6 +366,7 @@ export function WriterPage({
   const wasAiPanelOpenRef = useRef(isAiPanelOpen)
   const activeAiRequestIdRef = useRef("")
   const activeAiMessageIdRef = useRef("")
+  const aiMessagesRef = useRef<AiMessage[]>([])
   const activeGitSyncRequestIdRef = useRef("")
   const gitSyncResetTimerRef = useRef<number | null>(null)
   const isDirtyRef = useRef(false)
@@ -196,11 +374,30 @@ export function WriterPage({
   const isDirty = Boolean(document) && content !== document.content
   isDirtyRef.current = isDirty
   const currentCharacterCount = countCharacters(content)
+  const hasPendingAiChanges = aiMessages.some((message) => message.changeStatus === "pending")
+
+  const updateAiMessages = useCallback((
+    updater: AiMessage[] | ((current: AiMessage[]) => AiMessage[]),
+  ) => {
+    const nextMessages = typeof updater === "function"
+      ? updater(aiMessagesRef.current)
+      : updater
+    aiMessagesRef.current = nextMessages
+    setAiMessages(nextMessages)
+  }, [])
 
   useEffect(() => {
     onDirtyChange(isDirty)
     return () => onDirtyChange(false)
   }, [isDirty, onDirtyChange])
+
+  useEffect(() => {
+    onAiRunningChange(isAiThinking)
+  }, [isAiThinking, onAiRunningChange])
+
+  useEffect(() => () => {
+    onAiRunningChange(false)
+  }, [onAiRunningChange])
 
   useEffect(() => {
     let isCurrent = true
@@ -241,7 +438,7 @@ export function WriterPage({
   useEffect(() => {
     const wasPanelOpen = wasAiPanelOpenRef.current
     wasAiPanelOpenRef.current = isAiPanelOpen
-    if (!isAiPanelOpen || !aiMessages.length) return
+    if (!isActive || !isAiPanelOpen || !aiMessages.length) return
     const shouldScrollInstantly = (
       shouldInstantAiScrollRef.current
       || !wasPanelOpen
@@ -253,7 +450,7 @@ export function WriterPage({
       block: "end",
     })
     if (shouldInstantAiScrollRef.current) shouldInstantAiScrollRef.current = false
-  }, [aiMessages, isAiHistoryLoading, isAiPanelOpen, isAiThinking])
+  }, [aiMessages, isActive, isAiHistoryLoading, isAiPanelOpen, isAiThinking])
 
   useEffect(() => window.authorDesk.ai.onChatProgress((progress) => {
     if (!progress.requestId || progress.requestId !== activeAiRequestIdRef.current) return
@@ -269,7 +466,7 @@ export function WriterPage({
         event: progress.toolEvent,
       })
     }
-    setAiMessages((current) => current.map((message) => {
+    updateAiMessages((current) => current.map((message) => {
       if (message.id !== messageId) return message
       if (progress.type === "content-delta" && progress.delta) {
         return {
@@ -298,7 +495,7 @@ export function WriterPage({
       }
       return message
     }))
-  }), [])
+  }), [updateAiMessages])
 
   useEffect(() => window.authorDesk.git.onSyncProgress((progress) => {
     if (
@@ -422,11 +619,14 @@ export function WriterPage({
     setIsCharacterDialogOpen(false)
     setIsWritingRulesDialogOpen(false)
     setIsReferenceStyleDialogOpen(false)
-    setAiMessages([])
+    updateAiMessages([])
     setAiChatSummary("")
     setAiCompactedCount(0)
     setAiInput("")
     setAiError("")
+    setIsAiStopping(false)
+    setActiveAiChangeSetId("")
+    setActiveAiChangeAction("")
     setIsAiCompacting(false)
     setAiToolSyncEvent(null)
     setIsGitSyncing(false)
@@ -448,7 +648,7 @@ export function WriterPage({
     window.authorDesk.ai.getHistory(project.path)
       .then((history) => {
         if (!isCurrent) return
-        setAiMessages(history.messages)
+        updateAiMessages(history.messages)
         setAiChatSummary(history.summary)
         setAiCompactedCount(history.compactedCount)
       })
@@ -483,7 +683,7 @@ export function WriterPage({
       isCurrent = false
       chapterRequestId.current += 1
     }
-  }, [loadChapter, project?.path])
+  }, [loadChapter, project?.path, updateAiMessages])
 
   const saveCurrentChapter = useCallback(async () => {
     if (!project || !activeChapterName || !document || isSaving) return false
@@ -691,9 +891,114 @@ export function WriterPage({
     onSaved()
   }
 
+  async function savePendingAiChanges(message: AiMessage) {
+    if (!project || !message.changeSetId || message.changeStatus !== "pending") return
+    if (isDirty) {
+      setAiError("请先保存当前编辑器中的正文，再保存 AI 修改。")
+      return
+    }
+    setActiveAiChangeSetId(message.changeSetId)
+    setActiveAiChangeAction("save")
+    setAiError("")
+    try {
+      const result = await window.authorDesk.ai.applyChanges(project.path, message.changeSetId)
+      const appliedEvents = new Map(result.toolEvents.map((event) => [event.path, event]))
+      const nextMessages = aiMessagesRef.current.map((currentMessage) => {
+        if (currentMessage.id !== message.id) return currentMessage
+        return {
+          ...currentMessage,
+          changeStatus: "saved" as const,
+          status: `已保存 ${result.appliedCount} 项修改`,
+          toolEvents: currentMessage.toolEvents?.map((event) => (
+            appliedEvents.get(event.path) || event
+          )),
+        }
+      })
+      updateAiMessages(nextMessages)
+      await window.authorDesk.ai.saveHistory(project.path, nextMessages)
+      await refreshAfterAiTools(result.toolEvents)
+    } catch (applyError) {
+      setAiError(applyError instanceof Error
+        ? applyError.message
+        : "保存 AI 修改失败")
+    } finally {
+      setActiveAiChangeSetId("")
+      setActiveAiChangeAction("")
+    }
+  }
+
+  async function cancelPendingAiChanges(message: AiMessage) {
+    if (!project || !message.changeSetId || message.changeStatus !== "pending") return
+    setActiveAiChangeSetId(message.changeSetId)
+    setActiveAiChangeAction("cancel")
+    setAiError("")
+    try {
+      const result = await window.authorDesk.ai.discardChanges(project.path, message.changeSetId)
+      const nextMessages = aiMessagesRef.current.map((currentMessage) => {
+        if (currentMessage.id !== message.id) return currentMessage
+        return {
+          ...currentMessage,
+          changeStatus: "canceled" as const,
+          status: `已取消 ${result.discardedCount} 项修改`,
+          toolEvents: currentMessage.toolEvents?.map((event) => (
+            ["created", "modified"].includes(event.kind)
+              ? {
+                  ...event,
+                  label: event.kind === "created" ? "已取消创建" : "已取消修改",
+                }
+              : event
+          )),
+        }
+      })
+      updateAiMessages(nextMessages)
+      await window.authorDesk.ai.saveHistory(project.path, nextMessages)
+    } catch (discardError) {
+      setAiError(discardError instanceof Error
+        ? discardError.message
+        : "取消 AI 修改失败")
+    } finally {
+      setActiveAiChangeSetId("")
+      setActiveAiChangeAction("")
+    }
+  }
+
+  async function stopAiMessage() {
+    const requestId = activeAiRequestIdRef.current
+    const messageId = activeAiMessageIdRef.current
+    if (!requestId || !isAiThinking || isAiStopping) return
+
+    setIsAiStopping(true)
+    setAiError("")
+    if (messageId) {
+      updateAiMessages((current) => current.map((message) => (
+        message.id === messageId
+          ? { ...message, status: "正在停止…" }
+          : message
+      )))
+    }
+    try {
+      const didCancel = await window.authorDesk.ai.cancelChat(requestId)
+      if (!didCancel && activeAiRequestIdRef.current === requestId) {
+        setAiError("当前 AI 请求已经结束，无需停止。")
+      }
+    } catch (cancelError) {
+      setAiError(cancelError instanceof Error
+        ? `停止 AI 请求失败：${cancelError.message}`
+        : "停止 AI 请求失败")
+      setIsAiStopping(false)
+    }
+  }
+
   async function sendAiMessage(explicitPrompt?: string) {
     const prompt = (explicitPrompt ?? aiInput).trim()
-    if (!project || !prompt || isAiThinking || isAiHistoryLoading || isAiCompacting) return
+    if (
+      !project
+      || !prompt
+      || isAiThinking
+      || isAiHistoryLoading
+      || isAiCompacting
+      || hasPendingAiChanges
+    ) return
     const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
     const userMessage: AiMessage = {
       id: `${requestId}-user`,
@@ -702,7 +1007,7 @@ export function WriterPage({
     }
     const nextMessages = [...aiMessages, userMessage]
     const assistantMessageId = `${requestId}-assistant`
-    setAiMessages([
+    updateAiMessages([
       ...nextMessages,
       {
         id: assistantMessageId,
@@ -718,6 +1023,7 @@ export function WriterPage({
     setAiInput("")
     setAiError("")
     setIsAiThinking(true)
+    setIsAiStopping(false)
     try {
       try {
         await window.authorDesk.ai.saveHistory(project.path, nextMessages)
@@ -750,9 +1056,22 @@ export function WriterPage({
           role: "assistant",
           content: response.content,
           toolEvents: response.toolEvents,
+          status: response.changeSetId
+            ? `等待确认 ${response.pendingChangeCount} 项修改`
+            : response.autoReviewed
+              ? "已自动审核并收束"
+              : undefined,
+          changeSetId: response.changeSetId || undefined,
+          changeStatus: response.changeSetId ? "pending" : undefined,
         },
       ]
-      setAiMessages(completedMessages)
+      updateAiMessages(completedMessages)
+      if (activeAiRequestIdRef.current === requestId) {
+        activeAiRequestIdRef.current = ""
+        activeAiMessageIdRef.current = ""
+      }
+      setIsAiThinking(false)
+      setIsAiStopping(false)
       try {
         await window.authorDesk.ai.saveHistory(project.path, completedMessages)
       } catch (historyError) {
@@ -765,7 +1084,7 @@ export function WriterPage({
         const compacted = await window.authorDesk.ai.compactHistory(project.path)
         setAiChatSummary(compacted.summary)
         setAiCompactedCount(compacted.compactedCount)
-        if (compacted.didCompact) setAiMessages(compacted.messages)
+        if (compacted.didCompact) updateAiMessages(compacted.messages)
       } catch (compactError) {
         setAiError(compactError instanceof Error
           ? `对话已保存，但自动压缩失败：${compactError.message}`
@@ -773,14 +1092,33 @@ export function WriterPage({
       } finally {
         setIsAiCompacting(false)
       }
-      try {
-        await refreshAfterAiTools(response.toolEvents)
-      } catch (refreshError) {
-        setAiError(refreshError instanceof Error
-          ? refreshError.message
-          : "AI 已完成操作，但作品界面刷新失败")
+      if (!response.changeSetId) {
+        try {
+          await refreshAfterAiTools(response.toolEvents)
+        } catch (refreshError) {
+          setAiError(refreshError instanceof Error
+            ? refreshError.message
+            : "AI 已完成操作，但作品界面刷新失败")
+        }
       }
     } catch (chatError) {
+      if (isAiChatCanceledError(chatError)) {
+        const stoppedMessages = aiMessagesRef.current.map((message) => (
+          message.id === assistantMessageId
+            ? {
+                ...message,
+                content: message.content.trim() ? message.content : "已停止生成。",
+                isStreaming: false,
+                status: "已停止",
+                hasError: false,
+              }
+            : message
+        ))
+        updateAiMessages(stoppedMessages)
+        setAiError("")
+        window.authorDesk.ai.saveHistory(project.path, stoppedMessages).catch(() => {})
+        return
+      }
       const formattedError = formatAiChatError(chatError)
       const failedMessages: AiMessage[] = [
         ...nextMessages,
@@ -793,7 +1131,7 @@ export function WriterPage({
         },
       ]
       setAiError(formattedError)
-      setAiMessages(failedMessages)
+      updateAiMessages(failedMessages)
       window.authorDesk.ai.saveHistory(project.path, failedMessages).catch(() => {})
     } finally {
       if (activeAiRequestIdRef.current === requestId) {
@@ -801,6 +1139,7 @@ export function WriterPage({
         activeAiMessageIdRef.current = ""
       }
       setIsAiThinking(false)
+      setIsAiStopping(false)
     }
   }
 
@@ -1164,15 +1503,30 @@ export function WriterPage({
                 </p>
               </div>
               <div className="ml-auto flex items-center gap-0.5">
+                {isAiThinking && (
+                  <span
+                    className="mr-1 inline-flex h-7 items-center gap-1.5 rounded-full bg-secondary px-2.5 text-[10px] font-medium text-primary"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <LoaderCircle className="size-3 animate-spin" />
+                    {isAiStopping ? "停止中" : "运行中"}
+                  </span>
+                )}
                 {aiMessages.length > 0 && (
                   <Button
                     variant="ghost"
                     size="icon-sm"
                     aria-label="清空对话"
-                    title="清空对话"
-                    disabled={isAiThinking || isAiHistoryLoading || isAiCompacting}
+                    title={hasPendingAiChanges ? "请先保存或取消待确认修改" : "清空对话"}
+                    disabled={
+                      isAiThinking
+                      || isAiHistoryLoading
+                      || isAiCompacting
+                      || hasPendingAiChanges
+                    }
                     onClick={async () => {
-                      setAiMessages([])
+                      updateAiMessages([])
                       setAiChatSummary("")
                       setAiCompactedCount(0)
                       setAiError("")
@@ -1284,7 +1638,13 @@ export function WriterPage({
                               <span className={`ml-auto max-w-36 truncate rounded-full px-2 py-0.5 text-[9px] ${
                                 message.hasError
                                   ? "bg-red-100 text-destructive"
-                                  : "ai-status-shimmer bg-secondary text-primary"
+                                  : message.isStreaming
+                                    ? "ai-status-shimmer bg-secondary text-primary"
+                                    : message.changeStatus === "pending"
+                                      ? "bg-amber-50 text-amber-700"
+                                    : message.status === "已自动审核并收束"
+                                      ? "bg-emerald-50 text-success"
+                                      : "bg-muted text-muted-foreground"
                               }`}>
                                 {message.status}
                               </span>
@@ -1310,10 +1670,11 @@ export function WriterPage({
                           </p>
                         )}
 
-                        {message.toolEvents?.map((toolEvent, index) => (
+                        {getVisibleAiToolEvents(message.toolEvents).map((toolEvent, index) => (
                           <details
                             key={`${message.id}-${toolEvent.path}-${index}`}
-                            className="ai-tool-enter mt-2 overflow-hidden rounded-lg border border-border bg-muted/35"
+                            className="group/diff ai-tool-enter mt-2 overflow-hidden rounded-lg border border-border bg-muted/35"
+                            defaultOpen={Boolean(toolEvent.diff)}
                           >
                             <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-[11px] font-medium">
                               <Wrench className="size-3.5 text-primary" />
@@ -1321,14 +1682,58 @@ export function WriterPage({
                               <span className="ml-auto max-w-32 truncate text-muted-foreground" title={toolEvent.path}>
                                 {toolEvent.path}
                               </span>
+                              {toolEvent.diff && (
+                                <span className="inline-flex shrink-0 items-center gap-0.5 text-[9px] text-muted-foreground">
+                                  <span className="group-open/diff:hidden">展开</span>
+                                  <span className="hidden group-open/diff:inline">收起</span>
+                                  <ChevronDown className="size-3 transition-transform group-open/diff:rotate-180" />
+                                </span>
+                              )}
                             </summary>
                             {toolEvent.diff && (
-                              <pre className="max-h-40 overflow-auto border-t border-border bg-[#242424] p-3 text-[10px] leading-4 whitespace-pre-wrap text-[#f4f4f4]">
-                                {toolEvent.diff}
-                              </pre>
+                              <AiDiffView diff={toolEvent.diff} />
                             )}
                           </details>
                         ))}
+
+                        {message.changeStatus === "pending" && message.changeSetId && (
+                          <div className="mt-2.5 rounded-xl border border-amber-200 bg-amber-50/55 p-2.5">
+                            <div className="flex items-start gap-2">
+                              <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-amber-600" />
+                              <p className="text-[10px] leading-4 text-amber-800">
+                                文件尚未写入。请检查上方差异，然后保存或取消整组修改。
+                              </p>
+                            </div>
+                            <div className="mt-2 flex justify-end gap-2">
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-7 border-amber-200 bg-white px-2.5 text-[10px] hover:bg-amber-50"
+                                disabled={Boolean(activeAiChangeSetId)}
+                                onClick={() => cancelPendingAiChanges(message)}
+                              >
+                                {activeAiChangeSetId === message.changeSetId
+                                  && activeAiChangeAction === "cancel" && (
+                                  <LoaderCircle className="size-3 animate-spin" />
+                                )}
+                                取消修改
+                              </Button>
+                              <Button
+                                size="sm"
+                                className="h-7 px-2.5 text-[10px]"
+                                disabled={Boolean(activeAiChangeSetId) || isDirty}
+                                title={isDirty ? "请先保存当前正文" : "将整组修改写入作品文件"}
+                                onClick={() => savePendingAiChanges(message)}
+                              >
+                                {activeAiChangeSetId === message.changeSetId
+                                  && activeAiChangeAction === "save" && (
+                                  <LoaderCircle className="size-3 animate-spin" />
+                                )}
+                                保存修改
+                              </Button>
+                            </div>
+                          </div>
+                        )}
 
                         {message.role === "assistant" && !message.isStreaming && Boolean(message.content) && (
                           <button
@@ -1372,6 +1777,7 @@ export function WriterPage({
                     || isAiThinking
                     || isAiHistoryLoading
                     || isAiCompacting
+                    || hasPendingAiChanges
                   }
                   aria-label="AI 对话内容"
                   placeholder={isAiHistoryLoading
@@ -1380,32 +1786,54 @@ export function WriterPage({
                       ? "正在压缩较早的对话记忆…"
                     : isAiThinking
                       ? "AI 正在回复…"
+                      : hasPendingAiChanges
+                        ? "请先保存或取消上方待确认修改…"
                       : "向 AI 提问，或让它修改作品文件…"}
                   className="w-full resize-none bg-transparent px-1.5 py-1 text-xs leading-5 outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed"
                 />
                 <div className="mt-1 flex items-center justify-between gap-2">
                   <span className="pl-1 text-[10px] text-muted-foreground">
-                    {isDirty ? "请先保存正文，AI 才能修改文件" : "Enter 发送 · Shift+Enter 换行"}
+                    {isAiThinking
+                      ? isAiStopping
+                        ? "正在安全停止当前任务…"
+                        : "AI 正在运行，可随时手动停止"
+                      : hasPendingAiChanges
+                        ? "请先保存或取消待确认修改"
+                      : isDirty
+                        ? "请先保存正文，AI 才能修改文件"
+                        : "Enter 发送 · Shift+Enter 换行"}
                   </span>
-                  <Button
-                    size="icon-sm"
-                    aria-label="发送消息"
-                    title="发送"
-                    disabled={
-                      !aiConfig.hasApiKey
-                      || !aiInput.trim()
-                      || isAiThinking
-                      || isAiHistoryLoading
-                      || isAiCompacting
-                    }
-                    onClick={() => sendAiMessage()}
-                  >
-                    {isAiThinking ? (
-                      <LoaderCircle className="size-3.5 animate-spin" />
-                    ) : (
+                  {isAiThinking ? (
+                    <Button
+                      variant="outline"
+                      size="icon-sm"
+                      className="border-primary/20 bg-secondary text-primary hover:border-primary/35 hover:bg-primary/10"
+                      aria-label={isAiStopping ? "正在停止 AI" : "停止 AI"}
+                      title={isAiStopping ? "正在停止" : "停止生成"}
+                      disabled={isAiStopping}
+                      onClick={stopAiMessage}
+                    >
+                      {isAiStopping
+                        ? <LoaderCircle className="size-3.5 animate-spin" />
+                        : <Square className="size-3 fill-current" />}
+                    </Button>
+                  ) : (
+                    <Button
+                      size="icon-sm"
+                      aria-label="发送消息"
+                      title="发送"
+                      disabled={
+                        !aiConfig.hasApiKey
+                        || !aiInput.trim()
+                        || isAiHistoryLoading
+                        || isAiCompacting
+                        || hasPendingAiChanges
+                      }
+                      onClick={() => sendAiMessage()}
+                    >
                       <Send className="size-3.5" />
-                    )}
-                  </Button>
+                    </Button>
+                  )}
                 </div>
               </div>
             </div>

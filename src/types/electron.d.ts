@@ -108,7 +108,10 @@ type AiToolEvent = {
 type AiStoredMessage = AiChatMessage & {
   id: string
   toolEvents?: AiToolEvent[]
+  status?: string
   hasError?: boolean
+  changeSetId?: string
+  changeStatus?: "pending" | "saved" | "canceled"
 }
 
 type AiChatHistory = {
@@ -346,6 +349,19 @@ declare global {
           content: string
           model: string
           toolEvents: AiToolEvent[]
+          autoReviewed: boolean
+          changeSetId: string
+          pendingChangeCount: number
+        }>
+        cancelChat(requestId: string): Promise<boolean>
+        applyChanges(projectPath: string, changeSetId: string): Promise<{
+          ok: boolean
+          appliedCount: number
+          toolEvents: AiToolEvent[]
+        }>
+        discardChanges(projectPath: string, changeSetId: string): Promise<{
+          ok: boolean
+          discardedCount: number
         }>
         getHistory(projectPath: string): Promise<AiChatHistory>
         saveHistory(projectPath: string, messages: AiStoredMessage[]): Promise<AiChatHistory>

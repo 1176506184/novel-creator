@@ -56,7 +56,7 @@ document.querySelectorAll("[data-year]").forEach((node) => {
 });
 
 const repository = "1176506184/novel-creator";
-const releaseUrl = `https://github.com/${repository}/releases/latest`;
+const releaseUrl = `https://github.com/${repository}/releases`;
 
 const updateReleaseLinks = async () => {
   try {
@@ -81,7 +81,7 @@ const updateReleaseLinks = async () => {
       });
     }
   } catch {
-    // GitHub API 暂时不可用时，保留 releases/latest 作为可靠降级链接。
+    // GitHub API 暂时不可用或还没有 Release 时，保留版本列表作为可靠降级链接。
   }
 };
 

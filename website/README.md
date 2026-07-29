@@ -9,7 +9,7 @@
 - `script.js`：移动导航、滚动呈现和最新 Release 检测
 - `assets/`：应用品牌图标
 
-下载按钮默认指向仓库的 `releases/latest`。发布 GitHub Release 后，页面会自动读取最新版本号，并优先链接到其中的 Windows `.exe` 文件。
+下载按钮默认指向仓库的 Releases 列表。发布 GitHub Release 后，页面会自动读取最新版本号，并优先链接到其中的 Windows `.exe` 文件。
 
 ## 发布
 

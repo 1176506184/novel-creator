@@ -1,0 +1,86 @@
+{
+  "name": "novel-creator",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "yarn@1.22.22",
+  "description": "An Electron author workspace powered by React, shadcn/ui and a built-in Node.js service.",
+  "author": "作者管家",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:electron\"",
+    "dev:renderer": "vite --host 127.0.0.1",
+    "dev:electron": "wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
+    "build": "vite build",
+    "pack": "yarn build && electron-builder --dir",
+    "dist:win": "yarn build && electron-builder --win nsis",
+    "dist:portable": "yarn build && electron-builder --win portable",
+    "start": "yarn dev"
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "^1.2.4",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "tailwind-merge": "^3.4.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.0.4",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.5",
+    "wait-on": "^9.0.3"
+  },
+  "build": {
+    "appId": "com.novelcreator.author-desk",
+    "productName": "作者管家",
+    "copyright": "Copyright © 2026 作者管家",
+    "asar": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "assets/app-icon-32.png",
+      "assets/app-icon-256.png",
+      "assets/app-icon.ico",
+      "package.json"
+    ],
+    "win": {
+      "icon": "assets/app-icon.ico",
+      "executableName": "作者管家",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "作者管家",
+      "artifactName": "作者管家-${version}-安装包.${ext}",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "作者管家-${version}-便携版.${ext}"
+    }
+  }
+}

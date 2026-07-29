@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://1176506184.github.io/novel-creator/sitemap.xml

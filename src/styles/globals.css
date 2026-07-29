@@ -1,0 +1,264 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-canvas: var(--canvas);
+  --color-success: var(--success);
+  --font-sans: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-editorial: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+:root {
+  color-scheme: light;
+  --background: #ffffff;
+  --foreground: #2b2522;
+  --card: #ffffff;
+  --card-foreground: #2b2522;
+  --primary: #ff4d1f;
+  --primary-foreground: #ffffff;
+  --secondary: #fff1eb;
+  --secondary-foreground: #963514;
+  --muted: #f7f5f4;
+  --muted-foreground: #8f8783;
+  --accent: #fff0e9;
+  --accent-foreground: #e94316;
+  --destructive: #dc3d3d;
+  --border: #eee8e5;
+  --input: #ddd4d0;
+  --ring: #ff7448;
+  --sidebar: #fffdfc;
+  --canvas: #f8f7f6;
+  --success: #20a162;
+  --brand-glow: rgba(255, 77, 31, 0.11);
+}
+
+* {
+  box-sizing: border-box;
+  border-color: var(--border);
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  font-family: var(--font-sans);
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+textarea,
+input,
+select {
+  font: inherit;
+}
+
+textarea,
+input,
+select {
+  user-select: text;
+}
+
+button {
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.window-drag {
+  -webkit-app-region: drag;
+}
+
+.window-no-drag,
+.window-no-drag * {
+  -webkit-app-region: no-drag;
+}
+
+.eyebrow {
+  margin: 0;
+  color: var(--primary);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+}
+
+.surface-card {
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  background: color-mix(in srgb, var(--card) 94%, transparent);
+  box-shadow:
+    0 1px 2px rgba(30, 30, 30, 0.02),
+    0 10px 28px rgba(30, 30, 30, 0.035);
+}
+
+.feature-surface {
+  background:
+    radial-gradient(circle at 100% 0%, color-mix(in srgb, var(--primary) 10%, transparent), transparent 42%),
+    linear-gradient(135deg, #ffffff 0%, color-mix(in srgb, var(--secondary) 42%, #ffffff) 100%);
+}
+
+@keyframes ai-message-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes ai-assistant-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 77, 31, 0.08);
+    transform: scale(1);
+  }
+  50% {
+    box-shadow: 0 0 0 5px rgba(255, 77, 31, 0.1);
+    transform: scale(1.05);
+  }
+}
+
+@keyframes ai-status-sweep {
+  from {
+    background-position: 130% 0;
+  }
+  to {
+    background-position: -130% 0;
+  }
+}
+
+@keyframes ai-orbit-ring {
+  from {
+    opacity: 0.75;
+    transform: scale(0.78) rotate(0deg);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.45) rotate(180deg);
+  }
+}
+
+@keyframes ai-loading-sweep {
+  from {
+    background-position: 130% 0;
+  }
+  to {
+    background-position: -130% 0;
+  }
+}
+
+@keyframes ai-cursor-blink {
+  0%,
+  45% {
+    opacity: 1;
+  }
+  46%,
+  100% {
+    opacity: 0.15;
+  }
+}
+
+@keyframes ai-tool-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.ai-message-enter {
+  animation: ai-message-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.ai-assistant-breathe {
+  animation: ai-assistant-breathe 1.6s ease-in-out infinite;
+}
+
+.ai-status-shimmer {
+  background-image: linear-gradient(
+    100deg,
+    var(--secondary) 20%,
+    color-mix(in srgb, var(--primary) 16%, var(--secondary)) 45%,
+    var(--secondary) 70%
+  );
+  background-size: 220% 100%;
+  animation: ai-status-sweep 1.8s linear infinite;
+}
+
+.ai-thinking-orbit::after {
+  position: absolute;
+  inset: -4px;
+  border: 1.5px solid color-mix(in srgb, var(--primary) 55%, transparent);
+  border-right-color: transparent;
+  border-radius: 999px;
+  content: "";
+  animation: ai-orbit-ring 1.4s ease-out infinite;
+}
+
+.ai-loading-line {
+  background-image: linear-gradient(
+    100deg,
+    var(--muted) 15%,
+    color-mix(in srgb, var(--primary) 13%, white) 45%,
+    var(--muted) 75%
+  );
+  background-size: 220% 100%;
+  animation: ai-loading-sweep 1.5s linear infinite;
+}
+
+.ai-stream-cursor {
+  animation: ai-cursor-blink 800ms steps(1, end) infinite;
+}
+
+.ai-tool-enter {
+  animation: ai-tool-in 180ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: #cfcfcf;
+  background-clip: content-box;
+}

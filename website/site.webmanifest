@@ -1,0 +1,22 @@
+{
+  "name": "作者管家",
+  "short_name": "作者管家",
+  "description": "本地优先的 AI 小说写作工作台",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#fffaf6",
+  "theme_color": "#ff5a2a",
+  "icons": [
+    {
+      "src": "./assets/app-icon-32.png",
+      "sizes": "32x32",
+      "type": "image/png"
+    },
+    {
+      "src": "./assets/app-icon-256.png",
+      "sizes": "256x256",
+      "type": "image/png"
+    }
+  ]
+}

@@ -138,6 +138,79 @@ export type ReferenceStyleState = {
   profile: ReferenceStyleProfile | null
 }
 
+export type BookBreakdownBeat = {
+  order: number
+  stage: string
+  chapterRange: string
+  event: string
+  function: string
+  conflict: string
+  turn: string
+  consequence: string
+  tension: number
+}
+
+export type BookBreakdownReport = {
+  overview: string
+  premise: string
+  themes: string[]
+  centralConflict: string
+  storyPhases: Array<{
+    name: string
+    range: string
+    goal: string
+    development: string
+    result: string
+  }>
+  beats: BookBreakdownBeat[]
+  characterArcs: Array<{
+    name: string
+    role: string
+    start: string
+    desire: string
+    obstacle: string
+    change: string
+    end: string
+  }>
+  conflictEscalation: string[]
+  setupPayoffs: Array<{
+    setup: string
+    payoff: string
+    effect: string
+  }>
+  pacing: string
+  reusablePatterns: Array<{
+    title: string
+    mechanism: string
+    whyItWorks: string
+    adaptationDirections: string[]
+  }>
+  originalityWarnings: string[]
+}
+
+export type BookBreakdownState = {
+  exists: boolean
+  path: string
+  directory: string
+  sourcePath: string
+  sourceName: string
+  sourceBytes: number
+  characterCount: number
+  importedAt: string | null
+  generatedAt: string | null
+  model: string
+  analyzedChunks: number
+  report: BookBreakdownReport | null
+}
+
+export type BookBreakdownProgress = {
+  requestId: string
+  phase: "reading" | "splitting" | "analyzing" | "synthesizing" | "saving" | "retrying" | "complete"
+  label: string
+  completed?: number
+  total?: number
+}
+
 export type StyleComparisonArticle = {
   name: string
   path: string

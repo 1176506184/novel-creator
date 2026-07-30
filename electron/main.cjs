@@ -1,6 +1,6 @@
 const path = require("node:path")
 const fs = require("node:fs")
-const { randomUUID } = require("node:crypto")
+const { createHash, randomUUID } = require("node:crypto")
 const { spawn } = require("node:child_process")
 const {
   app,
@@ -1028,6 +1028,7 @@ const AI_CHAT_TOOL_ROUND_LIMIT = 12
 const AI_CHAT_SOFT_REVIEW_ROUND = 8
 const AI_CHAT_DUPLICATE_TOOL_LIMIT = 3
 const activeAiChatControllers = new Map()
+const activeBookBreakdownControllers = new Map()
 
 function getAiWrapUpReasoningEffort(reasoningEffort) {
   return ["high", "xhigh", "max", "ultra"].includes(reasoningEffort)
@@ -2609,6 +2610,509 @@ function createReferenceStylePrompt(state) {
     "当前作品启用了参考文风。请只遵循以下高层风格规律，不要复制参考小说原句、专有角色、地名或剧情：",
     state.profile.writingPrompt || JSON.stringify(state.profile, null, 2),
   ].join("\n")
+}
+
+function bookBreakdownDirectory(projectPath) {
+  if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) {
+    throw new Error("作品目录不在当前小说库中")
+  }
+  return path.join(path.resolve(projectPath), "参考小说", "拆书")
+}
+
+function bookBreakdownStatePath(projectPath) {
+  return path.join(bookBreakdownDirectory(projectPath), "拆书.json")
+}
+
+function bookBreakdownSourcePath(projectPath) {
+  return path.join(bookBreakdownDirectory(projectPath), "原文.txt")
+}
+
+function bookBreakdownProgressPath(projectPath) {
+  return path.join(bookBreakdownDirectory(projectPath), ".拆书进度.json")
+}
+
+function emptyBookBreakdownState(projectPath) {
+  return {
+    exists: false,
+    path: bookBreakdownStatePath(projectPath),
+    directory: bookBreakdownDirectory(projectPath),
+    sourcePath: "",
+    sourceName: "",
+    sourceBytes: 0,
+    characterCount: 0,
+    importedAt: null,
+    generatedAt: null,
+    model: "",
+    analyzedChunks: 0,
+    report: null,
+  }
+}
+
+function normalizeBookBreakdownReport(rawReport) {
+  if (!rawReport || typeof rawReport !== "object") throw new Error("AI 返回的拆书结果无效")
+  const storyPhases = (Array.isArray(rawReport.storyPhases) ? rawReport.storyPhases : [])
+    .map((phase) => ({
+      name: safeGraphText(phase?.name, "未命名阶段", 120),
+      range: safeGraphText(phase?.range, "范围未明确", 160),
+      goal: safeGraphText(phase?.goal, "未明确", 800),
+      development: safeGraphText(phase?.development, "未明确", 1600),
+      result: safeGraphText(phase?.result, "未明确", 800),
+    }))
+    .slice(0, 16)
+  const beats = (Array.isArray(rawReport.beats) ? rawReport.beats : [])
+    .map((beat, index) => ({
+      order: Number.isFinite(Number(beat?.order))
+        ? Math.max(1, Math.floor(Number(beat.order)))
+        : index + 1,
+      stage: safeGraphText(beat?.stage, `情节点 ${index + 1}`, 120),
+      chapterRange: safeGraphText(beat?.chapterRange, "位置未明确", 160),
+      event: safeGraphText(beat?.event, "事件未明确", 1600),
+      function: safeGraphText(beat?.function, "作用未明确", 1200),
+      conflict: safeGraphText(beat?.conflict, "冲突未明确", 1200),
+      turn: safeGraphText(beat?.turn, "转折未明确", 1200),
+      consequence: safeGraphText(beat?.consequence, "结果未明确", 1200),
+      tension: Math.min(5, Math.max(1, Math.round(Number(beat?.tension) || 3))),
+    }))
+    .slice(0, 36)
+    .sort((left, right) => left.order - right.order)
+  if (!beats.length) throw new Error("AI 拆书结果中没有识别到有效情节点")
+
+  return {
+    overview: safeGraphText(rawReport.overview, "暂无整体概述", 3000),
+    premise: safeGraphText(rawReport.premise, "核心前提未明确", 1600),
+    themes: safeGraphStringList(rawReport.themes, 16),
+    centralConflict: safeGraphText(rawReport.centralConflict, "核心冲突未明确", 2000),
+    storyPhases,
+    beats,
+    characterArcs: (Array.isArray(rawReport.characterArcs) ? rawReport.characterArcs : [])
+      .map((arc) => ({
+        name: safeGraphText(arc?.name, "未命名人物", 100),
+        role: safeGraphText(arc?.role, "人物", 100),
+        start: safeGraphText(arc?.start, "未明确", 800),
+        desire: safeGraphText(arc?.desire, "未明确", 800),
+        obstacle: safeGraphText(arc?.obstacle, "未明确", 800),
+        change: safeGraphText(arc?.change, "未明确", 1200),
+        end: safeGraphText(arc?.end, "未明确", 800),
+      }))
+      .slice(0, 16),
+    conflictEscalation: safeGraphStringList(rawReport.conflictEscalation, 24),
+    setupPayoffs: (Array.isArray(rawReport.setupPayoffs) ? rawReport.setupPayoffs : [])
+      .map((item) => ({
+        setup: safeGraphText(item?.setup, "伏笔未明确", 800),
+        payoff: safeGraphText(item?.payoff, "回收未明确", 800),
+        effect: safeGraphText(item?.effect, "作用未明确", 800),
+      }))
+      .slice(0, 24),
+    pacing: safeGraphText(rawReport.pacing, "节奏规律未明确", 2400),
+    reusablePatterns: (Array.isArray(rawReport.reusablePatterns) ? rawReport.reusablePatterns : [])
+      .map((pattern) => ({
+        title: safeGraphText(pattern?.title, "可借鉴机制", 120),
+        mechanism: safeGraphText(pattern?.mechanism, "机制未明确", 1200),
+        whyItWorks: safeGraphText(pattern?.whyItWorks, "作用未明确", 1200),
+        adaptationDirections: safeGraphStringList(pattern?.adaptationDirections, 8),
+      }))
+      .slice(0, 20),
+    originalityWarnings: safeGraphStringList(rawReport.originalityWarnings, 20),
+  }
+}
+
+function parseBookBreakdownJson(content, label = "拆书结果") {
+  if (typeof content !== "string" || !content.trim()) throw new Error(`AI 没有返回${label}`)
+  const trimmed = content.trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+  const startIndex = trimmed.indexOf("{")
+  const endIndex = trimmed.lastIndexOf("}")
+  if (startIndex < 0 || endIndex <= startIndex) throw new Error(`AI 没有返回有效的${label} JSON`)
+  try {
+    return JSON.parse(trimmed.slice(startIndex, endIndex + 1))
+  } catch {
+    throw new Error(`AI 返回的${label} JSON 无法解析，请重新分析`)
+  }
+}
+
+async function getBookBreakdown(projectPath) {
+  const statePath = bookBreakdownStatePath(projectPath)
+  try {
+    const data = JSON.parse(await fs.promises.readFile(statePath, "utf8"))
+    return {
+      exists: true,
+      path: statePath,
+      directory: bookBreakdownDirectory(projectPath),
+      sourcePath: typeof data?.sourcePath === "string" ? data.sourcePath : "",
+      sourceName: typeof data?.sourceName === "string" ? data.sourceName : "",
+      sourceBytes: Number.isFinite(data?.sourceBytes) ? Math.max(0, data.sourceBytes) : 0,
+      characterCount: Number.isFinite(data?.characterCount)
+        ? Math.max(0, Math.floor(data.characterCount))
+        : 0,
+      importedAt: typeof data?.importedAt === "string" ? data.importedAt : null,
+      generatedAt: typeof data?.generatedAt === "string" ? data.generatedAt : null,
+      model: typeof data?.model === "string" ? data.model : "",
+      analyzedChunks: Number.isFinite(data?.analyzedChunks)
+        ? Math.max(0, Math.floor(data.analyzedChunks))
+        : 0,
+      report: data?.report ? normalizeBookBreakdownReport(data.report) : null,
+    }
+  } catch (error) {
+    if (error?.code === "ENOENT") return emptyBookBreakdownState(projectPath)
+    throw new Error(`无法读取拆书结果：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+async function writeBookBreakdown(projectPath, state) {
+  const statePath = bookBreakdownStatePath(projectPath)
+  const normalized = {
+    version: 1,
+    sourcePath: String(state?.sourcePath || ""),
+    sourceName: String(state?.sourceName || ""),
+    sourceBytes: Number.isFinite(state?.sourceBytes) ? Math.max(0, state.sourceBytes) : 0,
+    characterCount: Number.isFinite(state?.characterCount)
+      ? Math.max(0, Math.floor(state.characterCount))
+      : 0,
+    importedAt: typeof state?.importedAt === "string" ? state.importedAt : null,
+    generatedAt: typeof state?.generatedAt === "string" ? state.generatedAt : null,
+    model: String(state?.model || ""),
+    analyzedChunks: Number.isFinite(state?.analyzedChunks)
+      ? Math.max(0, Math.floor(state.analyzedChunks))
+      : 0,
+    report: state?.report ? normalizeBookBreakdownReport(state.report) : null,
+  }
+  await fs.promises.mkdir(path.dirname(statePath), { recursive: true })
+  await fs.promises.writeFile(statePath, `${JSON.stringify(normalized, null, 2)}\n`, "utf8")
+  return {
+    exists: true,
+    path: statePath,
+    directory: bookBreakdownDirectory(projectPath),
+    ...normalized,
+  }
+}
+
+async function chooseBookBreakdownSource(projectPath) {
+  const current = await getBookBreakdown(projectPath)
+  const result = await dialog.showOpenDialog(mainWindow || undefined, {
+    title: "选择要拆解的本地 TXT 小说",
+    defaultPath: current.sourcePath ? path.dirname(current.sourcePath) : getLibraryRoot(),
+    properties: ["openFile"],
+    filters: [{ name: "TXT 小说", extensions: ["txt"] }],
+    buttonLabel: "导入并准备拆书",
+  })
+  if (result.canceled || !result.filePaths[0]) return current
+
+  const selectedPath = path.resolve(result.filePaths[0])
+  const stats = await fs.promises.stat(selectedPath)
+  if (!stats.isFile() || path.extname(selectedPath).toLowerCase() !== ".txt") {
+    throw new Error("请选择有效的 TXT 文件")
+  }
+  if (stats.size <= 0) throw new Error("选择的 TXT 文件为空")
+  if (stats.size > 16 * 1024 * 1024) throw new Error("TXT 文件不能超过 16MB")
+  const content = decodeReferenceText(await fs.promises.readFile(selectedPath))
+    .replace(/\u0000/g, "")
+    .trim()
+  if (content.length < 1_000) throw new Error("TXT 正文至少需要 1,000 个字符")
+  if (content.length > 3_000_000) throw new Error("TXT 正文超过 300 万字符，请先拆分后再导入")
+
+  const directory = bookBreakdownDirectory(projectPath)
+  const sourcePath = bookBreakdownSourcePath(projectPath)
+  await fs.promises.mkdir(directory, { recursive: true })
+  await fs.promises.writeFile(sourcePath, `${content}\n`, "utf8")
+  await fs.promises.unlink(bookBreakdownProgressPath(projectPath)).catch(() => {})
+  return writeBookBreakdown(projectPath, {
+    sourcePath,
+    sourceName: path.basename(selectedPath),
+    sourceBytes: Buffer.byteLength(content, "utf8"),
+    characterCount: content.length,
+    importedAt: new Date().toISOString(),
+    generatedAt: null,
+    model: "",
+    analyzedChunks: 0,
+    report: null,
+  })
+}
+
+function splitBookBreakdownText(content) {
+  const maximumChunks = 24
+  const targetSize = Math.max(60_000, Math.ceil(content.length / maximumChunks))
+  const chunks = []
+  let start = 0
+  while (start < content.length) {
+    let end = Math.min(content.length, start + targetSize)
+    if (end < content.length) {
+      const nextChapter = content.slice(end, Math.min(content.length, end + 8_000))
+        .search(/\n\s*第[^\n]{1,24}[章节卷回][^\n]*\n/)
+      if (nextChapter >= 0) {
+        end += nextChapter + 1
+      } else {
+        const lastBreak = content.lastIndexOf("\n", end)
+        if (lastBreak > start + Math.floor(targetSize * 0.75)) end = lastBreak + 1
+      }
+    }
+    const text = content.slice(start, end).trim()
+    if (text) {
+      const firstLine = text.split(/\r?\n/, 1)[0].trim().slice(0, 80)
+      chunks.push({
+        index: chunks.length,
+        start,
+        end,
+        label: firstLine || `文本片段 ${chunks.length + 1}`,
+        text,
+      })
+    }
+    start = end
+  }
+  return chunks
+}
+
+async function analyzeBookBreakdownChunk(chunk, totalChunks, config, endpoint, onProgress, signal) {
+  const assistantMessage = await requestAiCompletionWithRetry({
+    endpoint,
+    config,
+    signal,
+    onProgress: (progress) => {
+      if (progress?.type === "status" && progress.label) {
+        onProgress({
+          phase: "retrying",
+          label: `第 ${chunk.index + 1}/${totalChunks} 段：${progress.label}`,
+        })
+      }
+    },
+    body: JSON.stringify({
+      model: config.model,
+      reasoning_effort: "medium",
+      messages: [
+        {
+          role: "system",
+          content: [
+            "你是中文小说拆书编辑。请分析给定的连续正文片段在整部故事中的剧情推进作用。",
+            "只概括事件、因果、冲突、转折、人物变化、伏笔和阶段结果，不评价文笔，不续写，不大段引用原文。",
+            "必须只返回一个 JSON 对象，不使用 Markdown。",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: [
+            `这是全文第 ${chunk.index + 1}/${totalChunks} 个连续片段，字符位置约 ${chunk.start}-${chunk.end}。`,
+            `片段起始标识：${chunk.label}`,
+            "请返回：",
+            JSON.stringify({
+              range: "本段覆盖的章节或剧情位置",
+              summary: "本段剧情发展摘要",
+              events: [{
+                stage: "情节点名称",
+                event: "发生了什么",
+                cause: "为什么发生",
+                conflict: "主要阻力",
+                turn: "局势变化",
+                consequence: "导致什么后果",
+                tension: 3,
+              }],
+              characterChanges: ["人物在本段的目标、关系或状态变化"],
+              setups: ["埋下的伏笔或待解决问题"],
+              payoffs: ["回收的伏笔或兑现的承诺"],
+            }, null, 2),
+            "正文片段：",
+            chunk.text,
+          ].join("\n\n"),
+        },
+      ],
+      max_tokens: 4_000,
+      stream: true,
+    }),
+  })
+  try {
+    return parseBookBreakdownJson(assistantMessage?.content, "分段摘要")
+  } catch {
+    return {
+      range: chunk.label,
+      summary: safeGraphText(assistantMessage?.content, "本段摘要解析失败", 6_000),
+      events: [],
+      characterChanges: [],
+      setups: [],
+      payoffs: [],
+    }
+  }
+}
+
+async function requestBookBreakdown(projectPath, onProgress = () => {}, signal) {
+  const current = await getBookBreakdown(projectPath)
+  if (!current.sourcePath) throw new Error("请先导入本地 TXT 小说")
+  onProgress({ phase: "reading", label: "正在读取本地 TXT…" })
+  const sourcePath = bookBreakdownSourcePath(projectPath)
+  const content = (await fs.promises.readFile(sourcePath, "utf8")).replace(/\u0000/g, "").trim()
+  if (content.length < 1_000) throw new Error("本地 TXT 正文内容不足")
+  const sourceHash = createHash("sha256").update(content).digest("hex")
+  const chunks = splitBookBreakdownText(content)
+  if (!chunks.length) throw new Error("无法从 TXT 中读取正文")
+  onProgress({
+    phase: "splitting",
+    label: `已将全文划分为 ${chunks.length} 个连续片段`,
+    completed: 0,
+    total: chunks.length,
+  })
+
+  const config = getApiRuntimeConfig()
+  const endpoint = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`
+  const progressPath = bookBreakdownProgressPath(projectPath)
+  let partials = new Array(chunks.length)
+  try {
+    const cached = JSON.parse(await fs.promises.readFile(progressPath, "utf8"))
+    if (cached?.sourceHash === sourceHash && Array.isArray(cached.partials)) {
+      partials = chunks.map((_, index) => cached.partials[index] || null)
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") await fs.promises.unlink(progressPath).catch(() => {})
+  }
+  let completed = partials.filter(Boolean).length
+  if (completed) {
+    onProgress({
+      phase: "analyzing",
+      label: `已恢复 ${completed}/${chunks.length} 段分析进度`,
+      completed,
+      total: chunks.length,
+    })
+  }
+
+  for (let batchStart = 0; batchStart < chunks.length; batchStart += 2) {
+    throwIfAiRequestCanceled(signal)
+    const batch = chunks
+      .slice(batchStart, batchStart + 2)
+      .filter((chunk) => !partials[chunk.index])
+    if (!batch.length) continue
+    onProgress({
+      phase: "analyzing",
+      label: `AI 正在拆解第 ${batch[0].index + 1}-${batch.at(-1).index + 1} 段…`,
+      completed,
+      total: chunks.length,
+    })
+    const results = await Promise.all(batch.map((chunk) => (
+      analyzeBookBreakdownChunk(chunk, chunks.length, config, endpoint, onProgress, signal)
+    )))
+    results.forEach((result, index) => {
+      partials[batch[index].index] = result
+    })
+    completed = partials.filter(Boolean).length
+    await fs.promises.writeFile(progressPath, `${JSON.stringify({
+      version: 1,
+      sourceHash,
+      updatedAt: new Date().toISOString(),
+      partials,
+    }, null, 2)}\n`, "utf8")
+    onProgress({
+      phase: "analyzing",
+      label: `已完成 ${completed}/${chunks.length} 段`,
+      completed,
+      total: chunks.length,
+    })
+  }
+
+  throwIfAiRequestCanceled(signal)
+  onProgress({
+    phase: "synthesizing",
+    label: "正在合并全文情节发展与人物弧线…",
+    completed: chunks.length,
+    total: chunks.length,
+  })
+  const finalMessage = await requestAiCompletionWithRetry({
+    endpoint,
+    config,
+    signal,
+    onProgress: (progress) => {
+      if (progress?.type === "status" && progress.label) {
+        onProgress({ phase: "retrying", label: progress.label })
+      }
+    },
+    body: JSON.stringify({
+      model: config.model,
+      reasoning_effort: config.reasoningEffort,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "你是专业的中文小说拆书编辑。请根据按原文顺序排列的分段摘要，还原整部小说的故事发展结构。",
+            "重点分析因果链、冲突升级、关键转折、人物弧线、伏笔回收、节奏变化和可复用的高层故事机制。",
+            "可复用机制必须抽象，不得鼓励复制原作专有角色、名称、设定、原句或完全相同的事件排列。",
+            "必须只返回一个 JSON 对象，不使用 Markdown。",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: [
+            `参考小说：${current.sourceName}`,
+            `全文约 ${content.length} 字，共 ${chunks.length} 个分析片段。`,
+            "请严格按以下结构返回：",
+            JSON.stringify({
+              overview: "全书故事发展概述",
+              premise: "一句话核心故事前提",
+              themes: ["主题"],
+              centralConflict: "贯穿全书的核心冲突及其演变",
+              storyPhases: [{
+                name: "故事阶段名称",
+                range: "章节或剧情范围",
+                goal: "该阶段主角目标",
+                development: "主要发展",
+                result: "阶段结果及如何进入下一阶段",
+              }],
+              beats: [{
+                order: 1,
+                stage: "关键情节点",
+                chapterRange: "章节或剧情位置",
+                event: "发生的关键事件",
+                function: "该事件在结构中的作用",
+                conflict: "主要冲突",
+                turn: "转折",
+                consequence: "后续影响",
+                tension: 3,
+              }],
+              characterArcs: [{
+                name: "人物",
+                role: "故事作用",
+                start: "初始状态",
+                desire: "核心欲望",
+                obstacle: "主要阻力",
+                change: "变化过程",
+                end: "最终状态",
+              }],
+              conflictEscalation: ["冲突如何逐级升级"],
+              setupPayoffs: [{
+                setup: "伏笔或承诺",
+                payoff: "如何回收",
+                effect: "产生的剧情效果",
+              }],
+              pacing: "全书节奏、高潮密度和张弛规律",
+              reusablePatterns: [{
+                title: "可借鉴的高层机制",
+                mechanism: "抽象运作方式",
+                whyItWorks: "为什么有效",
+                adaptationDirections: ["更换题材、人物关系或矛盾后的原创变体方向"],
+              }],
+              originalityWarnings: ["借鉴时不能照搬的专有元素或高相似风险"],
+            }, null, 2),
+            "按顺序排列的分段分析：",
+            JSON.stringify(partials),
+          ].join("\n\n"),
+        },
+      ],
+      max_tokens: 10_000,
+      stream: true,
+    }),
+  })
+  const report = normalizeBookBreakdownReport(
+    parseBookBreakdownJson(finalMessage?.content),
+  )
+  throwIfAiRequestCanceled(signal)
+  onProgress({ phase: "saving", label: "正在保存拆书 JSON…" })
+  const nextState = await writeBookBreakdown(projectPath, {
+    ...current,
+    sourcePath,
+    sourceBytes: Buffer.byteLength(content, "utf8"),
+    characterCount: content.length,
+    generatedAt: new Date().toISOString(),
+    model: config.model,
+    analyzedChunks: chunks.length,
+    report,
+  })
+  await fs.promises.unlink(progressPath).catch(() => {})
+  onProgress({ phase: "complete", label: "拆书完成" })
+  return nextState
 }
 
 const STYLE_COMPARISON_DIMENSIONS = [

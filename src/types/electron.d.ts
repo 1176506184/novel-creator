@@ -237,6 +237,79 @@ type ReferenceStyleState = {
   profile: ReferenceStyleProfile | null
 }
 
+type BookBreakdownBeat = {
+  order: number
+  stage: string
+  chapterRange: string
+  event: string
+  function: string
+  conflict: string
+  turn: string
+  consequence: string
+  tension: number
+}
+
+type BookBreakdownReport = {
+  overview: string
+  premise: string
+  themes: string[]
+  centralConflict: string
+  storyPhases: Array<{
+    name: string
+    range: string
+    goal: string
+    development: string
+    result: string
+  }>
+  beats: BookBreakdownBeat[]
+  characterArcs: Array<{
+    name: string
+    role: string
+    start: string
+    desire: string
+    obstacle: string
+    change: string
+    end: string
+  }>
+  conflictEscalation: string[]
+  setupPayoffs: Array<{
+    setup: string
+    payoff: string
+    effect: string
+  }>
+  pacing: string
+  reusablePatterns: Array<{
+    title: string
+    mechanism: string
+    whyItWorks: string
+    adaptationDirections: string[]
+  }>
+  originalityWarnings: string[]
+}
+
+type BookBreakdownState = {
+  exists: boolean
+  path: string
+  directory: string
+  sourcePath: string
+  sourceName: string
+  sourceBytes: number
+  characterCount: number
+  importedAt: string | null
+  generatedAt: string | null
+  model: string
+  analyzedChunks: number
+  report: BookBreakdownReport | null
+}
+
+type BookBreakdownProgress = {
+  requestId: string
+  phase: "reading" | "splitting" | "analyzing" | "synthesizing" | "saving" | "retrying" | "complete"
+  label: string
+  completed?: number
+  total?: number
+}
+
 type StyleComparisonArticle = {
   name: string
   path: string
@@ -424,6 +497,17 @@ declare global {
         chooseDirectory(projectPath: string): Promise<ReferenceStyleState>
         summarize(projectPath: string): Promise<ReferenceStyleState>
         openDirectory(projectPath: string): Promise<boolean>
+      }
+      bookBreakdown: {
+        get(projectPath: string): Promise<BookBreakdownState>
+        chooseSource(projectPath: string): Promise<BookBreakdownState>
+        analyze(input: {
+          requestId: string
+          projectPath: string
+        }): Promise<BookBreakdownState>
+        cancel(requestId: string): Promise<boolean>
+        openDirectory(projectPath: string): Promise<boolean>
+        onProgress(callback: (progress: BookBreakdownProgress) => void): () => void
       }
       styleComparison: {
         chooseArticle(defaultPath?: string): Promise<StyleComparisonArticle | null>

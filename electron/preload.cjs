@@ -113,6 +113,23 @@ contextBridge.exposeInMainWorld("authorDesk", {
       ipcRenderer.invoke("reference-style:open-directory", projectPath)
     ),
   },
+  bookBreakdown: {
+    get: (projectPath) => ipcRenderer.invoke("book-breakdown:get", projectPath),
+    chooseSource: (projectPath) => (
+      ipcRenderer.invoke("book-breakdown:choose-source", projectPath)
+    ),
+    analyze: (input) => ipcRenderer.invoke("book-breakdown:analyze", input),
+    cancel: (requestId) => ipcRenderer.invoke("book-breakdown:cancel", requestId),
+    openDirectory: (projectPath) => (
+      ipcRenderer.invoke("book-breakdown:open-directory", projectPath)
+    ),
+    onProgress: (callback) => {
+      if (typeof callback !== "function") return () => {}
+      const listener = (_event, progress) => callback(progress)
+      ipcRenderer.on("book-breakdown:progress", listener)
+      return () => ipcRenderer.removeListener("book-breakdown:progress", listener)
+    },
+  },
   styleComparison: {
     chooseArticle: (defaultPath) => (
       ipcRenderer.invoke("style-comparison:choose-article", defaultPath)

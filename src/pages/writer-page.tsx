@@ -66,6 +66,14 @@ type AiToolEvent = {
   diff?: string
 }
 
+type AiDiagnostics = {
+  elapsedMs: number
+  modelDurationMs: number
+  toolDurationMs: number
+  modelRequestCount: number
+  toolCallCount: number
+}
+
 type AiMessage = {
   id: string
   role: "user" | "assistant"
@@ -76,6 +84,7 @@ type AiMessage = {
   hasError?: boolean
   changeSetId?: string
   changeStatus?: "pending" | "saved" | "canceled" | "expired"
+  diagnostics?: AiDiagnostics
 }
 
 type ChapterContextMenu = {
@@ -93,6 +102,14 @@ const numberFormatter = new Intl.NumberFormat("zh-CN")
 
 function countCharacters(content: string) {
   return content.replace(/\s/g, "").length
+}
+
+function formatAiDuration(durationMs: number) {
+  if (durationMs < 1_000) return `${Math.max(0, Math.round(durationMs))} 毫秒`
+  if (durationMs < 60_000) return `${(durationMs / 1_000).toFixed(durationMs < 10_000 ? 1 : 0)} 秒`
+  const minutes = Math.floor(durationMs / 60_000)
+  const seconds = Math.round((durationMs % 60_000) / 1_000)
+  return `${minutes} 分 ${seconds} 秒`
 }
 
 function formatAiChatError(error: unknown) {
@@ -1163,6 +1180,7 @@ export function WriterPage({
               : undefined,
           changeSetId: response.changeSetId || undefined,
           changeStatus: response.changeSetId ? "pending" : undefined,
+          diagnostics: response.diagnostics,
         },
       ]
       updateAiMessages(completedMessages)
@@ -1605,7 +1623,7 @@ export function WriterPage({
               <div className="ml-auto flex items-center gap-0.5">
                 {isAiThinking && (
                   <span
-                    className="mr-1 inline-flex h-7 items-center gap-1.5 rounded-full bg-secondary px-2.5 text-[10px] font-medium text-primary"
+                    className="mr-1 inline-flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full bg-secondary px-2.5 text-[10px] font-medium text-primary"
                     role="status"
                     aria-live="polite"
                   >
@@ -1770,6 +1788,17 @@ export function WriterPage({
                               ? formatAiDisplayContent(message.content)
                               : message.content}
                             {message.isStreaming && <span className="ai-stream-cursor ml-0.5 inline-block h-3.5 w-[2px] translate-y-0.5 rounded-full bg-primary" />}
+                          </p>
+                        )}
+
+                        {message.role === "assistant" && message.diagnostics && (
+                          <p
+                            className="mt-2 text-[9px] text-muted-foreground/80"
+                            title={`模型等待 ${formatAiDuration(message.diagnostics.modelDurationMs)} · 本地工具 ${formatAiDuration(message.diagnostics.toolDurationMs)}`}
+                          >
+                            用时 {formatAiDuration(message.diagnostics.elapsedMs)}
+                            {" · "}{message.diagnostics.modelRequestCount} 轮模型
+                            {" · "}{message.diagnostics.toolCallCount} 次工具
                           </p>
                         )}
 

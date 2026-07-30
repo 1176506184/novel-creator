@@ -35,6 +35,14 @@ const DEFAULT_API_CONFIG = {
 const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"])
 const CLOSE_BEHAVIORS = new Set(["ask", "tray", "quit"])
 const WRITING_RULE_EXTENSIONS = new Set([".md", ".markdown", ".mdc", ".txt"])
+const WRITING_RULE_DISCOVERY_PATTERN = /^rules-.*\.md$/i
+const WRITING_RULE_IGNORED_DIRECTORIES = new Set([
+  ".git",
+  ".chat",
+  "node_modules",
+  "release",
+  "dist",
+])
 const MAX_WRITING_RULE_FILES = 100
 const MAX_WRITING_RULE_PROMPT_LENGTH = 60_000
 const WRITING_RULE_SETTINGS_FILE = ".author-desk.json"
@@ -236,6 +244,27 @@ const AI_CHAT_TOOLS = [
           content: { type: "string", description: "新文件的完整内容" },
         },
         required: ["path", "content"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "stage_file_edit",
+      description: "用精确文本替换生成并暂存文件修改，同时返回待确认 diff。不会立即写入文件；用户保存后才真正生效。修改文件时优先使用此工具，避免先后调用 preview_file_diff 和 modify_file。",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "相对于当前小说目录的路径" },
+          old_text: {
+            type: "string",
+            description: "文件中必须存在的原文；目标是 0 字节空文件时传空字符串",
+          },
+          new_text: { type: "string", description: "替换后的新文本" },
+          replace_all: { type: "boolean", description: "是否替换全部匹配，默认只替换第一处" },
+        },
+        required: ["path", "old_text", "new_text"],
         additionalProperties: false,
       },
     },
@@ -803,8 +832,8 @@ async function executeAiFileTool(toolName, args, toolContext) {
     }
   }
 
-  if (toolName === "modify_file") {
-    if (!toolContext.previewedPaths.has(relativePath)) {
+  if (toolName === "modify_file" || toolName === "stage_file_edit") {
+    if (toolName === "modify_file" && !toolContext.previewedPaths.has(relativePath)) {
       throw new Error("修改文件前必须先调用 preview_file_diff 生成差异")
     }
     const oldText = String(args.old_text || "")
@@ -983,6 +1012,7 @@ const AI_TOOL_PROGRESS_LABELS = {
   read_chapters: "正在批量读取章节…",
   read_file: "正在读取作品文件…",
   create_file: "正在准备新文件…",
+  stage_file_edit: "正在生成并暂存修改差异…",
   preview_file_diff: "正在生成修改差异…",
   modify_file: "正在准备文件修改…",
 }
@@ -998,6 +1028,12 @@ const AI_CHAT_TOOL_ROUND_LIMIT = 12
 const AI_CHAT_SOFT_REVIEW_ROUND = 8
 const AI_CHAT_DUPLICATE_TOOL_LIMIT = 3
 const activeAiChatControllers = new Map()
+
+function getAiWrapUpReasoningEffort(reasoningEffort) {
+  return ["high", "xhigh", "max", "ultra"].includes(reasoningEffort)
+    ? "medium"
+    : reasoningEffort
+}
 
 function createAiRequestCanceledError() {
   const error = new Error("AI 请求已由用户停止")
@@ -1110,6 +1146,16 @@ function normalizeAiHistoryMessages(messages) {
       const changeStatus = String(message.changeStatus || "")
       if (["pending", "saved", "canceled", "expired"].includes(changeStatus)) {
         normalized.changeStatus = changeStatus
+      }
+      if (message.diagnostics && typeof message.diagnostics === "object") {
+        const diagnostics = {
+          elapsedMs: Math.max(0, Math.floor(Number(message.diagnostics.elapsedMs) || 0)),
+          modelDurationMs: Math.max(0, Math.floor(Number(message.diagnostics.modelDurationMs) || 0)),
+          toolDurationMs: Math.max(0, Math.floor(Number(message.diagnostics.toolDurationMs) || 0)),
+          modelRequestCount: Math.max(0, Math.floor(Number(message.diagnostics.modelRequestCount) || 0)),
+          toolCallCount: Math.max(0, Math.floor(Number(message.diagnostics.toolCallCount) || 0)),
+        }
+        if (diagnostics.elapsedMs > 0) normalized.diagnostics = diagnostics
       }
       return normalized
     })
@@ -1364,7 +1410,7 @@ async function compactAiChatHistory(projectPath) {
 async function requestAiChat(input, onProgress = () => {}, signal) {
   throwIfAiRequestCanceled(signal)
   if (!input || typeof input !== "object") throw new Error("AI 对话参数无效")
-  const messages = Array.isArray(input.messages)
+  const normalizedMessages = Array.isArray(input.messages)
     ? input.messages
       .filter((message) => (
         message
@@ -1372,18 +1418,33 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
         && typeof message.content === "string"
         && message.content.trim()
       ))
-      .slice(-24)
+      .slice(-AI_CHAT_RECENT_MESSAGE_COUNT)
       .map((message) => ({
         role: message.role,
         content: message.content.trim().slice(0, 20_000),
       }))
     : []
+  let recentMessageBudget = 60_000
+  const messages = normalizedMessages
+    .slice()
+    .reverse()
+    .map((message) => {
+      if (recentMessageBudget <= 0) return null
+      const content = message.content.slice(0, recentMessageBudget)
+      recentMessageBudget -= content.length
+      return { ...message, content }
+    })
+    .filter(Boolean)
+    .reverse()
   if (!messages.length || messages.at(-1).role !== "user") throw new Error("请输入要发送的内容")
 
   const context = input.context && typeof input.context === "object" ? input.context : {}
   const projectName = String(context.projectName || "").slice(0, 200)
   const chapterName = String(context.chapterName || "").slice(0, 200)
-  const chapterContent = String(context.chapterContent || "").slice(-40_000)
+  const rawChapterContent = String(context.chapterContent || "")
+  const chapterContent = rawChapterContent.slice(-40_000)
+  const hasCompleteChapterContent = rawChapterContent.length <= 40_000
+  const currentChapterPath = chapterName ? `正文/${chapterName}` : ""
   const chatSummary = String(context.chatSummary || "").slice(0, 20_000)
   const projectPath = String(context.projectPath || "")
   if (!isPathInsideLibrary(projectPath)) throw new Error("当前作品目录无效")
@@ -1407,9 +1468,13 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
         "你是作者管家中的小说创作助手，通过直接 API 和本地文件工具工作，不能执行任何命令。",
         "你可以协助续写、润色、剧情分析、人物一致性检查，并可使用工具读取、创建或修改当前小说中的文本文件。",
         "分析多个章节时，先调用 list_chapters 获取准确目录，再使用 read_chapters 一次批量读取相关章节；不要逐章反复调用 read_file。",
-        "只有用户明确要求创建或修改文件时，才可调用 create_file 或 modify_file。",
-        "修改文件前应先读取文件并使用 preview_file_diff 检查拟议变化；所有写操作只会暂存，必须由用户查看差异并点击保存后才真正写入。",
-        "向 0 字节空文件首次写入内容时，调用 modify_file 并传 old_text=\"\"、new_text=完整内容；非空文件仍必须传入精确存在的 old_text。",
+        "只有用户明确要求创建或修改文件时，才可调用 create_file 或 stage_file_edit。",
+        "修改文件时优先调用 stage_file_edit，一次完成精确替换、差异生成和修改暂存；不要再先调用 preview_file_diff 后调用 modify_file。所有写操作仍必须由用户查看差异并点击保存后才真正写入。",
+        "只有在用户明确要求仅预览、不要暂存修改时才调用 preview_file_diff；modify_file 仅用于兼容已有流程。",
+        "向 0 字节空文件首次写入内容时，调用 stage_file_edit 并传 old_text=\"\"、new_text=完整内容；非空文件仍必须传入精确存在的 old_text。",
+        currentChapterPath && hasCompleteChapterContent
+          ? `当前章节 ${currentChapterPath} 的完整正文已附在上下文中。修改这个文件时直接使用附带正文调用 stage_file_edit，不要再调用 list_chapters、read_chapters 或 read_file 重复读取。`
+          : "若当前章节正文没有完整附带，修改前应先读取目标文件。",
         "工具返回 staged=true 时，只能称为“已准备修改”或“等待用户确认”，不得声称文件已经保存。",
         "不得删除文件，不得访问当前小说目录之外的路径。",
         "回答和续写正文时直接输出清晰段落，不要把每一行写成 Markdown 引用块，不要反复使用行首符号 >。",
@@ -1449,6 +1514,21 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
   const executedToolCallSignatures = new Set()
   let duplicateToolCallCount = 0
   let didAddSoftReviewPrompt = false
+  const requestStartedAt = Date.now()
+  let modelRequestCount = 0
+  let modelDurationMs = 0
+  let toolCallCount = 0
+  let toolDurationMs = 0
+
+  async function requestTrackedCompletion(options) {
+    modelRequestCount += 1
+    const startedAt = Date.now()
+    try {
+      return await requestAiCompletionWithRetry(options)
+    } finally {
+      modelDurationMs += Date.now() - startedAt
+    }
+  }
 
   async function createAiChatResult(content, autoReviewed) {
     const pendingPaths = new Set(pendingChanges.keys())
@@ -1471,6 +1551,13 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
       autoReviewed,
       changeSetId,
       pendingChangeCount: pendingChanges.size,
+      diagnostics: {
+        elapsedMs: Date.now() - requestStartedAt,
+        modelDurationMs,
+        toolDurationMs,
+        modelRequestCount,
+        toolCallCount,
+      },
     }
   }
 
@@ -1493,14 +1580,16 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
         "不要再请求调用工具，不要只回复错误提示。",
       ].join("\n"),
     })
-    const reviewedMessage = await requestAiCompletionWithRetry({
+    const reviewedMessage = await requestTrackedCompletion({
       endpoint,
       config,
       onProgress,
       signal,
       body: JSON.stringify({
         model: config.model,
-        reasoning_effort: config.reasoningEffort,
+        reasoning_effort: pendingChanges.size
+          ? getAiWrapUpReasoningEffort(config.reasoningEffort)
+          : config.reasoningEffort,
         messages: apiMessages,
         max_tokens: 4096,
         stream: true,
@@ -1520,18 +1609,20 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
       type: "status",
       label: round === 0 ? "正在理解你的问题…" : "正在整理工具结果…",
     })
-    const assistantMessage = await requestAiCompletionWithRetry({
+    const assistantMessage = await requestTrackedCompletion({
       endpoint,
       config,
       onProgress,
       signal,
       body: JSON.stringify({
         model: config.model,
-        reasoning_effort: config.reasoningEffort,
+        reasoning_effort: pendingChanges.size
+          ? getAiWrapUpReasoningEffort(config.reasoningEffort)
+          : config.reasoningEffort,
         messages: apiMessages,
         tools: AI_CHAT_TOOLS,
         tool_choice: "auto",
-        parallel_tool_calls: false,
+        parallel_tool_calls: true,
         max_tokens: 4096,
         stream: true,
       }),
@@ -1601,12 +1692,19 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
       }
       executedToolCallSignatures.add(toolCallSignature)
       try {
-        const execution = await executeAiFileTool(toolName, args, {
-          projectPath,
-          allowWriteTools: input.allowWriteTools === true,
-          previewedPaths,
-          pendingChanges,
-        })
+        toolCallCount += 1
+        const toolStartedAt = Date.now()
+        let execution
+        try {
+          execution = await executeAiFileTool(toolName, args, {
+            projectPath,
+            allowWriteTools: input.allowWriteTools === true,
+            previewedPaths,
+            pendingChanges,
+          })
+        } finally {
+          toolDurationMs += Date.now() - toolStartedAt
+        }
         toolEvents.push(execution.event)
         onProgress({ type: "tool-event", toolEvent: execution.event })
         apiMessages.push({
@@ -1731,22 +1829,39 @@ function writingRulesSettingsPath(projectPath) {
   return path.join(writingRulesRoot(projectPath), WRITING_RULE_SETTINGS_FILE)
 }
 
+function isManagedWritingRulePath(relativePathInput) {
+  const relativePath = String(relativePathInput || "").replace(/\\/g, "/").toLowerCase()
+  return relativePath.startsWith(".trae/rules/")
+}
+
+function isDiscoverableWritingRulePath(relativePathInput) {
+  const relativePath = String(relativePathInput || "").replace(/\\/g, "/")
+  return (
+    isManagedWritingRulePath(relativePath)
+    || WRITING_RULE_DISCOVERY_PATTERN.test(path.posix.basename(relativePath))
+  )
+}
+
 function normalizeWritingRuleRelativePath(projectPath, relativePathInput) {
-  const root = writingRulesRoot(projectPath)
+  const root = path.resolve(projectPath)
   const relativePath = String(relativePathInput || "").trim().replace(/\//g, path.sep)
   if (!relativePath || path.isAbsolute(relativePath)) throw new Error("规则文件路径无效")
   const targetPath = path.resolve(root, relativePath)
   const containedPath = path.relative(root, targetPath)
   if (!containedPath || containedPath.startsWith("..") || path.isAbsolute(containedPath)) {
-    throw new Error("规则文件必须位于 .trae/rules 目录中")
+    throw new Error("规则文件必须位于当前作品目录中")
   }
   if (!WRITING_RULE_EXTENSIONS.has(path.extname(targetPath).toLowerCase())) {
     throw new Error("规则文件仅支持 md、markdown、mdc 或 txt")
   }
+  const normalizedRelativePath = containedPath.replace(/\\/g, "/")
+  if (!isDiscoverableWritingRulePath(normalizedRelativePath)) {
+    throw new Error("作品目录中的规则文件名必须符合 rules-*.md")
+  }
   return {
     root,
     targetPath,
-    relativePath: path.relative(root, targetPath).replace(/\\/g, "/"),
+    relativePath: normalizedRelativePath,
   }
 }
 
@@ -1770,11 +1885,18 @@ async function readWritingRuleSettings(projectPath) {
   try {
     const data = JSON.parse(await fs.promises.readFile(settingsPath, "utf8"))
     const disabledRules = Array.isArray(data?.disabledRules)
-      ? [...new Set(data.disabledRules.map((item) => String(item || "").replace(/\\/g, "/")).filter(Boolean))]
+      ? [...new Set(data.disabledRules
+        .map((item) => String(item || "").replace(/\\/g, "/"))
+        .filter(Boolean)
+        .map((item) => (
+          Number(data?.version) >= 2 || isManagedWritingRulePath(item)
+            ? item
+            : `.trae/rules/${item}`
+        )))]
       : []
-    return { version: 1, disabledRules }
+    return { version: 2, disabledRules }
   } catch (error) {
-    if (error?.code === "ENOENT") return { version: 1, disabledRules: [] }
+    if (error?.code === "ENOENT") return { version: 2, disabledRules: [] }
     throw new Error(`无法读取写作规则设置：${error instanceof Error ? error.message : String(error)}`)
   }
 }
@@ -1782,7 +1904,7 @@ async function readWritingRuleSettings(projectPath) {
 async function writeWritingRuleSettings(projectPath, state) {
   const settingsPath = writingRulesSettingsPath(projectPath)
   const normalized = {
-    version: 1,
+    version: 2,
     disabledRules: [...new Set(
       (Array.isArray(state?.disabledRules) ? state.disabledRules : [])
         .map((item) => String(item || "").replace(/\\/g, "/"))
@@ -1810,7 +1932,7 @@ function createWritingRulesPrompt(state) {
     rule.content,
   ].join("\n"))
   return [
-    "以下是当前小说的 Trae 写作规则。创作、续写、润色和修改正文时必须遵守；若规则之间冲突，优先遵守更具体、更明确且与当前任务直接相关的规则。",
+    "以下是从当前小说目录自动识别并启用的写作规则。创作、续写、润色和修改正文时必须遵守；若规则之间冲突，优先遵守更具体、更明确且与当前任务直接相关的规则。",
     ...sections,
   ].join("\n").slice(0, MAX_WRITING_RULE_PROMPT_LENGTH)
 }
@@ -1822,30 +1944,7 @@ async function readWritingRules(projectPath) {
   const normalizedProject = path.resolve(projectPath)
   const projectStats = await fs.promises.stat(normalizedProject)
   if (!projectStats.isDirectory()) throw new Error("作品路径不是目录")
-  const root = writingRulesRoot(normalizedProject)
-  let rootStats = null
-  try {
-    rootStats = await fs.promises.stat(root)
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error
-  }
-  if (!rootStats) {
-    return {
-      ok: true,
-      exists: false,
-      root,
-      rules: [],
-      totalCharacters: 0,
-      injectedCharacters: 0,
-    }
-  }
-  if (!rootStats.isDirectory()) throw new Error(".trae/rules 不是目录")
-
   const realProjectPath = await fs.promises.realpath(normalizedProject)
-  const realRulesRoot = await fs.promises.realpath(root)
-  if (!isPathContained(realProjectPath, realRulesRoot)) {
-    throw new Error("Trae 规则目录指向当前作品之外")
-  }
   const ruleSettings = await readWritingRuleSettings(normalizedProject)
   const disabledRules = new Set(ruleSettings.disabledRules)
 
@@ -1859,27 +1958,30 @@ async function readWritingRules(projectPath) {
       const absolutePath = path.join(directoryPath, entry.name)
       const relativePath = path.join(relativeDirectory, entry.name)
       if (entry.isDirectory()) {
+        if (WRITING_RULE_IGNORED_DIRECTORIES.has(entry.name.toLowerCase())) continue
         await collectRules(absolutePath, relativePath, depth + 1)
         continue
       }
+      const normalizedRelativePath = relativePath.replace(/\\/g, "/")
       if (
         entry.isFile()
         && WRITING_RULE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
+        && isDiscoverableWritingRulePath(normalizedRelativePath)
       ) {
         rulePaths.push({
           absolutePath,
-          relativePath: relativePath.replace(/\\/g, "/"),
+          relativePath: normalizedRelativePath,
         })
       }
     }
   }
-  await collectRules(realRulesRoot)
+  await collectRules(realProjectPath)
 
   const rules = []
   for (const rulePath of rulePaths) {
     const realRulePath = await fs.promises.realpath(rulePath.absolutePath)
-    if (!isPathContained(realRulesRoot, realRulePath)) {
-      throw new Error(`规则文件指向目录之外：${rulePath.relativePath}`)
+    if (!isPathContained(realProjectPath, realRulePath)) {
+      throw new Error(`规则文件指向当前作品之外：${rulePath.relativePath}`)
     }
     const stats = await fs.promises.stat(realRulePath)
     if (!stats.isFile() || stats.size > 512 * 1024) continue
@@ -1905,8 +2007,8 @@ async function readWritingRules(projectPath) {
   ))
   const state = {
     ok: true,
-    exists: true,
-    root,
+    exists: rules.length > 0,
+    root: realProjectPath,
     rules,
     totalCharacters: rules.reduce((total, rule) => total + rule.characterCount, 0),
     injectedCharacters: 0,
@@ -1921,6 +2023,7 @@ async function createWritingRule(projectPath, input) {
   }
   const normalizedProject = path.resolve(projectPath)
   const name = normalizeNewWritingRuleName(input?.name)
+  const relativePath = path.join(".trae", "rules", name).replace(/\\/g, "/")
   const content = String(input?.content || "")
   if (content.length > 512 * 1024) throw new Error("单个规则不能超过 512KB")
   const root = writingRulesRoot(normalizedProject)
@@ -1938,13 +2041,13 @@ async function createWritingRule(projectPath, input) {
     throw error
   }
   const settings = await readWritingRuleSettings(normalizedProject)
-  if (settings.disabledRules.includes(name)) {
+  if (settings.disabledRules.includes(relativePath)) {
     await writeWritingRuleSettings(normalizedProject, {
-      disabledRules: settings.disabledRules.filter((item) => item !== name),
+      disabledRules: settings.disabledRules.filter((item) => item !== relativePath),
     })
   }
   return {
-    relativePath: name,
+    relativePath,
     state: await readWritingRules(normalizedProject),
   }
 }
@@ -1960,10 +2063,10 @@ async function saveWritingRule(projectPath, relativePathInput, contentInput) {
     normalizedProject,
     relativePathInput,
   )
-  const realRulesRoot = await fs.promises.realpath(root)
+  const realProjectPath = await fs.promises.realpath(root)
   const realTargetPath = await fs.promises.realpath(targetPath)
-  if (!isPathContained(realRulesRoot, realTargetPath)) {
-    throw new Error("规则文件指向目录之外")
+  if (!isPathContained(realProjectPath, realTargetPath)) {
+    throw new Error("规则文件指向当前作品之外")
   }
   const stats = await fs.promises.stat(realTargetPath)
   if (!stats.isFile()) throw new Error("目标规则不是文件")
@@ -1979,11 +2082,16 @@ async function setWritingRuleEnabled(projectPath, relativePathInput, enabledInpu
     throw new Error("作品目录不在当前小说库中")
   }
   const normalizedProject = path.resolve(projectPath)
-  const { targetPath, relativePath } = normalizeWritingRuleRelativePath(
+  const { root, targetPath, relativePath } = normalizeWritingRuleRelativePath(
     normalizedProject,
     relativePathInput,
   )
-  const stats = await fs.promises.stat(targetPath)
+  const realProjectPath = await fs.promises.realpath(root)
+  const realTargetPath = await fs.promises.realpath(targetPath)
+  if (!isPathContained(realProjectPath, realTargetPath)) {
+    throw new Error("规则文件指向当前作品之外")
+  }
+  const stats = await fs.promises.stat(realTargetPath)
   if (!stats.isFile()) throw new Error("目标规则不是文件")
   const settings = await readWritingRuleSettings(normalizedProject)
   const disabledRules = new Set(settings.disabledRules)
@@ -2007,10 +2115,10 @@ async function deleteWritingRule(projectPath, relativePathInput) {
     normalizedProject,
     relativePathInput,
   )
-  const realRulesRoot = await fs.promises.realpath(root)
+  const realProjectPath = await fs.promises.realpath(root)
   const realTargetPath = await fs.promises.realpath(targetPath)
-  if (!isPathContained(realRulesRoot, realTargetPath)) {
-    throw new Error("规则文件指向目录之外")
+  if (!isPathContained(realProjectPath, realTargetPath)) {
+    throw new Error("规则文件指向当前作品之外")
   }
   const stats = await fs.promises.stat(realTargetPath)
   if (!stats.isFile()) throw new Error("目标规则不是文件")
@@ -3844,8 +3952,7 @@ ipcMain.handle("rules:delete", (_event, projectPath, relativePath) => (
 
 ipcMain.handle("rules:open-folder", async (_event, projectPath) => {
   if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) return false
-  const root = writingRulesRoot(projectPath)
-  await fs.promises.mkdir(root, { recursive: true })
+  const root = path.resolve(projectPath)
   const errorMessage = await shell.openPath(root)
   return !errorMessage
 })

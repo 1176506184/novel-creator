@@ -290,7 +290,7 @@ export function WritingRulesDialog({
               <span className="ml-2 font-normal text-muted-foreground">· {project.name}</span>
             </h2>
             <p className="mt-0.5 truncate text-xs text-muted-foreground">
-              在软件内维护规则，同时兼容 `.trae/rules` 目录
+              自动识别作品目录内所有 `rules-*.md`，并兼容 `.trae/rules`
             </p>
           </div>
           <div className="ml-auto flex shrink-0 items-center gap-2">
@@ -308,7 +308,7 @@ export function WritingRulesDialog({
             </Button>
             <Button variant="ghost" size="sm" onClick={openRulesFolder}>
               <FolderOpen className="size-3.5" />
-              打开目录
+              打开作品目录
             </Button>
             <Button
               variant="ghost"

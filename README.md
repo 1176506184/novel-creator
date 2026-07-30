@@ -44,8 +44,8 @@ yarn dist:portable
 ```text
 release\
 ├─ win-unpacked\
-├─ 作者管家-0.1.2-安装包.exe
-└─ 作者管家-0.1.2-便携版.exe
+├─ 作者管家-0.1.3-安装包.exe
+└─ 作者管家-0.1.3-便携版.exe
 ```
 
 当前关闭了 ASAR，以保证内置 `electron/server.cjs` Node 服务可以从普通磁盘路径

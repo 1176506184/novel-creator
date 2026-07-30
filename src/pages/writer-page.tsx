@@ -9,6 +9,7 @@ import {
 import {
   ArrowLeft,
   BookMarked,
+  BookOpenCheck,
   BookOpenText,
   Bot,
   BrainCircuit,
@@ -38,6 +39,7 @@ import {
 } from "lucide-react"
 
 import { AiMemoryDialog } from "@/components/ai-memory-dialog"
+import { BookBreakdownDialog } from "@/components/book-breakdown-dialog"
 import { CharacterSettingsDialog } from "@/components/character-settings-dialog"
 import { ReferenceStyleDialog } from "@/components/reference-style-dialog"
 import { Button } from "@/components/ui/button"
@@ -366,6 +368,7 @@ export function WriterPage({
   const [isCharacterDialogOpen, setIsCharacterDialogOpen] = useState(false)
   const [isWritingRulesDialogOpen, setIsWritingRulesDialogOpen] = useState(false)
   const [isReferenceStyleDialogOpen, setIsReferenceStyleDialogOpen] = useState(false)
+  const [isBookBreakdownDialogOpen, setIsBookBreakdownDialogOpen] = useState(false)
   const [isAiPanelOpen, setIsAiPanelOpen] = useState(true)
   const [aiMessages, setAiMessages] = useState<AiMessage[]>([])
   const [aiChatSummary, setAiChatSummary] = useState("")
@@ -651,6 +654,7 @@ export function WriterPage({
     setIsCharacterDialogOpen(false)
     setIsWritingRulesDialogOpen(false)
     setIsReferenceStyleDialogOpen(false)
+    setIsBookBreakdownDialogOpen(false)
     updateAiMessages([])
     setAiChatSummary("")
     setAiCompactedCount(0)
@@ -1383,6 +1387,16 @@ export function WriterPage({
           >
             <BookMarked className="size-4" />
             参考文风
+          </Button>
+          <Button
+            variant="ghost"
+            className={isBookBreakdownDialogOpen ? "bg-secondary text-primary hover:bg-secondary" : ""}
+            aria-haspopup="dialog"
+            aria-expanded={isBookBreakdownDialogOpen}
+            onClick={() => setIsBookBreakdownDialogOpen(true)}
+          >
+            <BookOpenCheck className="size-4" />
+            拆书研究
           </Button>
           <Button
             variant="ghost"
@@ -2156,6 +2170,12 @@ export function WriterPage({
         open={isReferenceStyleDialogOpen}
         project={project}
         onClose={() => setIsReferenceStyleDialogOpen(false)}
+      />
+
+      <BookBreakdownDialog
+        open={isBookBreakdownDialogOpen}
+        project={project}
+        onClose={() => setIsBookBreakdownDialogOpen(false)}
       />
     </div>
   )

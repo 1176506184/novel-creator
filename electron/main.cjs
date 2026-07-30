@@ -4478,6 +4478,53 @@ ipcMain.handle("reference-style:open-directory", async (_event, projectPath) => 
   return !errorMessage
 })
 
+ipcMain.handle("book-breakdown:get", (_event, projectPath) => (
+  getBookBreakdown(projectPath)
+))
+
+ipcMain.handle("book-breakdown:choose-source", (_event, projectPath) => (
+  chooseBookBreakdownSource(projectPath)
+))
+
+ipcMain.handle("book-breakdown:analyze", async (event, input) => {
+  const requestId = String(input?.requestId || "")
+  const projectPath = String(input?.projectPath || "")
+  if (!requestId) throw new Error("拆书请求 ID 无效")
+  const requestKey = `${event.sender.id}:${requestId}`
+  const controller = new AbortController()
+  activeBookBreakdownControllers.set(requestKey, controller)
+  try {
+    return await requestBookBreakdown(projectPath, (progress) => {
+      if (event.sender.isDestroyed()) return
+      event.sender.send("book-breakdown:progress", {
+        requestId,
+        ...progress,
+      })
+    }, controller.signal)
+  } finally {
+    if (activeBookBreakdownControllers.get(requestKey) === controller) {
+      activeBookBreakdownControllers.delete(requestKey)
+    }
+  }
+})
+
+ipcMain.handle("book-breakdown:cancel", (event, requestIdInput) => {
+  const requestId = String(requestIdInput || "")
+  if (!requestId) return false
+  const requestKey = `${event.sender.id}:${requestId}`
+  const controller = activeBookBreakdownControllers.get(requestKey)
+  if (!controller) return false
+  controller.abort(createAiRequestCanceledError())
+  return true
+})
+
+ipcMain.handle("book-breakdown:open-directory", async (_event, projectPath) => {
+  const directory = bookBreakdownDirectory(projectPath)
+  await fs.promises.mkdir(directory, { recursive: true })
+  const errorMessage = await shell.openPath(directory)
+  return !errorMessage
+})
+
 ipcMain.handle("style-comparison:choose-article", (_event, defaultPath) => (
   chooseStyleComparisonArticle(defaultPath)
 ))

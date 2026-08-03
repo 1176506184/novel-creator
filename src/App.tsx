@@ -48,6 +48,7 @@ function MainWindow() {
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false)
   const [isSettingsDialogOpen, setIsSettingsDialogOpen] = useState(false)
   const [isStyleComparisonOpen, setIsStyleComparisonOpen] = useState(false)
+  const [isBootstrapping, setIsBootstrapping] = useState(true)
 
   const activeProject = useMemo(
     () => library.projects.find((project) => project.path === activeProjectPath) || null,
@@ -55,26 +56,48 @@ function MainWindow() {
   )
 
   useEffect(() => {
+    let isCurrent = true
     const timer = window.setTimeout(async () => {
-      const [serviceState, libraryState, savedProjectPath] = await Promise.all([
-        window.authorDesk.service.getHealth(),
-        window.authorDesk.library.getProjects(),
-        window.authorDesk.library.getActiveProject(),
-      ])
-      setService(serviceState)
-      setLibrary(libraryState)
+      try {
+        const [serviceState, libraryState, savedProjectPath] = await Promise.all([
+          window.authorDesk.service.getHealth(),
+          window.authorDesk.library.getProjects(),
+          window.authorDesk.library.getActiveProject(),
+        ])
+        if (!isCurrent) return
+        setService(serviceState)
+        setLibrary(libraryState)
 
-      const initialProject = libraryState.projects.find(
-        (project) => project.path === savedProjectPath,
-      ) || libraryState.projects[0]
-      if (initialProject) {
-        setActiveProjectPath(initialProject.path)
-        if (initialProject.path !== savedProjectPath) {
-          window.authorDesk.library.setActiveProject(initialProject.path)
+        const savedProject = libraryState.projects.find(
+          (project) => project.path === savedProjectPath,
+        )
+        if (savedProject) {
+          setActiveProjectPath(savedProject.path)
+          setActivePage("writer")
+          return
         }
+
+        const firstProject = libraryState.projects[0]
+        if (firstProject) {
+          setActiveProjectPath(firstProject.path)
+          await window.authorDesk.library.setActiveProject(firstProject.path)
+        }
+        setActivePage("works")
+      } catch (error) {
+        if (!isCurrent) return
+        setService({
+          ok: false,
+          message: error instanceof Error ? error.message : String(error),
+        })
+        setActivePage("works")
+      } finally {
+        if (isCurrent) setIsBootstrapping(false)
       }
     }, 500)
-    return () => window.clearTimeout(timer)
+    return () => {
+      isCurrent = false
+      window.clearTimeout(timer)
+    }
   }, [])
 
   async function selectProject(projectPath: string, openWriter = true) {
@@ -183,8 +206,26 @@ function MainWindow() {
   }
 
   return (
-    <main className="flex h-screen flex-col overflow-hidden rounded-[14px] border border-border bg-background text-foreground shadow-2xl">
+    <main className="relative flex h-screen flex-col overflow-hidden rounded-[14px] border border-border bg-background text-foreground shadow-2xl">
       <WindowTitlebar />
+
+      {isBootstrapping && (
+        <div
+          className="absolute inset-x-0 bottom-0 top-12 z-40 grid place-items-center bg-canvas"
+          role="status"
+          aria-live="polite"
+          aria-label="正在恢复上次工作区"
+        >
+          <div className="text-center">
+            <div className="relative mx-auto grid size-14 place-items-center rounded-2xl border border-primary/10 bg-secondary text-primary shadow-sm">
+              <BookOpenText className="size-6" />
+              <LoaderCircle className="absolute -bottom-1 -right-1 size-5 animate-spin rounded-full bg-white p-1 text-primary shadow-sm" />
+            </div>
+            <p className="mt-4 text-sm font-medium">正在恢复上次工作区</p>
+            <p className="mt-1.5 text-xs text-muted-foreground">读取小说库与上次选择的作品…</p>
+          </div>
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1">
         <aside className={`flex shrink-0 flex-col border-r border-border bg-sidebar px-3 pb-4 pt-3 transition-[width] duration-200 ${

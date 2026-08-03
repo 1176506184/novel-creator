@@ -5,6 +5,7 @@ const path = require("node:path")
 const HOST = "127.0.0.1"
 const PORT = Number(process.env.AUTHOR_DESK_SERVICE_PORT || 37891)
 const CHAPTER_EXTENSIONS = new Set([".txt", ".md", ".markdown"])
+const INTRODUCTION_FILE_NAME = "简介.md"
 const CHARACTER_DATA_DIRECTORY = "角色设置"
 const CHARACTER_GRAPH_FILE = "人物关系.json"
 
@@ -18,6 +19,62 @@ function sendJson(response, statusCode, data) {
 
 function countCharacters(content) {
   return content.replace(/\s/g, "").length
+}
+
+function parseIntroductionMarkdown(content) {
+  const source = String(content || "").replace(/^\uFEFF/, "").trim()
+  if (!source) return { shortTitle: "", synopsis: "" }
+
+  const lines = source.split(/\r?\n/)
+  let shortTitle = ""
+  const explicitTitleIndex = lines.findIndex((line) => (
+    /^\s*\*\*(?:一句话卖点|简短标题)[：:]\*\*\s*/.test(line)
+  ))
+  if (explicitTitleIndex >= 0) {
+    shortTitle = lines[explicitTitleIndex]
+      .replace(/^\s*\*\*(?:一句话卖点|简短标题)[：:]\*\*\s*/, "")
+      .trim()
+    lines.splice(explicitTitleIndex, 1)
+  }
+
+  const firstContentIndex = lines.findIndex((line) => line.trim())
+  if (firstContentIndex >= 0) {
+    const headingMatch = lines[firstContentIndex].match(/^\s*#\s+(.+?)\s*$/)
+    if (headingMatch) {
+      const heading = headingMatch[1].trim()
+      if (!shortTitle && !/^(?:作品)?简介$/.test(heading)) shortTitle = heading
+      lines.splice(firstContentIndex, 1)
+    }
+  }
+
+  const synopsis = lines
+    .filter((line) => !/^\s*#{1,6}\s+(?:作品)?简介\s*$/.test(line))
+    .join("\n")
+    .trim()
+  return { shortTitle: shortTitle.slice(0, 40), synopsis: synopsis.slice(0, 2_000) }
+}
+
+async function readProjectIntroduction(projectPath) {
+  const introductionPath = path.join(projectPath, INTRODUCTION_FILE_NAME)
+  try {
+    const stats = await fs.promises.lstat(introductionPath)
+    if (stats.isSymbolicLink() || !stats.isFile() || stats.size > 512 * 1024) {
+      return { exists: false, shortTitle: "", synopsis: "", modifiedTime: 0 }
+    }
+    const parsed = parseIntroductionMarkdown(
+      await fs.promises.readFile(introductionPath, "utf8"),
+    )
+    return {
+      exists: true,
+      ...parsed,
+      modifiedTime: stats.mtimeMs,
+    }
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { exists: false, shortTitle: "", synopsis: "", modifiedTime: 0 }
+    }
+    throw error
+  }
 }
 
 function isPathInside(parentPath, targetPath) {
@@ -254,10 +311,14 @@ async function scanProject(projectPath, directoryEntry) {
     }
   }))
 
-  const projectStats = await fs.promises.stat(projectPath)
+  const [projectStats, introduction] = await Promise.all([
+    fs.promises.stat(projectPath),
+    readProjectIntroduction(projectPath),
+  ])
   const latestChapter = [...chapterDetails].sort((left, right) => right.modifiedTime - left.modifiedTime)[0]
   const modifiedTime = Math.max(
     projectStats.mtimeMs,
+    introduction.modifiedTime,
     ...chapterDetails.map((chapter) => chapter.modifiedTime),
   )
 
@@ -268,6 +329,9 @@ async function scanProject(projectPath, directoryEntry) {
     chapterCount: chapterDetails.length,
     characterCount: chapterDetails.reduce((sum, chapter) => sum + chapter.characterCount, 0),
     latestChapter: latestChapter?.name || null,
+    introductionExists: introduction.exists,
+    shortTitle: introduction.shortTitle,
+    synopsis: introduction.synopsis,
     modifiedAt: new Date(modifiedTime).toISOString(),
   }
 }

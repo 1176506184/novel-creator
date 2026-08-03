@@ -409,10 +409,39 @@ export function BookBreakdownDialog({
                           <article key={`${phase.name}-${index}`} className="rounded-xl border border-border bg-muted/20 p-4">
                             <p className="text-[10px] font-medium text-primary">{phase.range}</p>
                             <h4 className="mt-1 text-sm font-semibold">{phase.name}</h4>
+                            <p className="mt-2 text-[10px] leading-4"><span className="text-muted-foreground">阶段目标：</span>{phase.goal}</p>
                             <p className="mt-2 text-xs leading-5 text-muted-foreground">{phase.development}</p>
                             <p className="mt-2 text-[10px] leading-4"><span className="text-muted-foreground">阶段结果：</span>{phase.result}</p>
                           </article>
                         ))}
+                      </div>
+                    </section>
+
+                    <section className="grid grid-cols-2 gap-4">
+                      <div className="rounded-xl border border-border bg-white p-5">
+                        <h3 className="text-sm font-semibold">冲突升级链</h3>
+                        <ol className="mt-4 space-y-3">
+                          {report.conflictEscalation.map((item, index) => (
+                            <li key={item} className="flex gap-3 text-xs leading-5">
+                              <span className="grid size-5 shrink-0 place-items-center rounded-full bg-secondary text-[9px] font-semibold text-primary">
+                                {index + 1}
+                              </span>
+                              <span>{item}</span>
+                            </li>
+                          ))}
+                        </ol>
+                      </div>
+                      <div className="rounded-xl border border-border bg-white p-5">
+                        <h3 className="text-sm font-semibold">伏笔与回收</h3>
+                        <div className="mt-4 space-y-3">
+                          {report.setupPayoffs.map((item, index) => (
+                            <article key={`${item.setup}-${index}`} className="rounded-lg bg-muted/30 px-3.5 py-3">
+                              <p className="text-[10px] leading-4"><span className="text-muted-foreground">埋设：</span>{item.setup}</p>
+                              <p className="mt-1.5 text-[10px] leading-4"><span className="text-muted-foreground">回收：</span>{item.payoff}</p>
+                              <p className="mt-1.5 text-[10px] leading-4 text-primary">{item.effect}</p>
+                            </article>
+                          ))}
+                        </div>
                       </div>
                     </section>
                   </main>

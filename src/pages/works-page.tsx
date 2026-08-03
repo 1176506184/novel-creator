@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   ChevronRight,
   CircleAlert,
+  FilePenLine,
   FileText,
   FolderCheck,
   FolderOpen,
@@ -22,6 +23,7 @@ import {
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { NovelIntroductionDialog } from "@/components/novel-introduction-dialog"
 import type {
   CreateProjectResult,
   LibraryProject,
@@ -77,6 +79,7 @@ export function WorksPage({
   const [isCreating, setIsCreating] = useState(false)
   const [createError, setCreateError] = useState("")
   const [creationNotice, setCreationNotice] = useState("")
+  const [introductionProject, setIntroductionProject] = useState<LibraryProject | null>(null)
 
   useEffect(() => {
     if (!renamingProject && !isCreateDialogOpen) return
@@ -153,6 +156,8 @@ export function WorksPage({
       ? library.projects.filter((project) => (
           project.name.toLocaleLowerCase("zh-CN").includes(normalizedQuery)
           || (project.latestChapter || "").toLocaleLowerCase("zh-CN").includes(normalizedQuery)
+          || (project.shortTitle || "").toLocaleLowerCase("zh-CN").includes(normalizedQuery)
+          || (project.synopsis || "").toLocaleLowerCase("zh-CN").includes(normalizedQuery)
         ))
       : [...library.projects]
 
@@ -342,6 +347,33 @@ export function WorksPage({
                     </Button>
                   </div>
 
+                  <div className="min-h-[76px] border-t border-border/70 px-5 py-3.5">
+                    {project.introductionExists ? (
+                      <>
+                        {project.shortTitle && (
+                          <p className="truncate text-xs font-semibold text-primary" title={project.shortTitle}>
+                            {project.shortTitle}
+                          </p>
+                        )}
+                        <p
+                          className={`${project.shortTitle ? "mt-1.5" : ""} overflow-hidden text-xs leading-5 text-muted-foreground [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]`}
+                          title={project.synopsis}
+                        >
+                          {project.synopsis || "简介.md 暂无正文内容"}
+                        </p>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="flex w-full items-center gap-2 rounded-lg py-1 text-left text-xs text-muted-foreground transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-primary/10"
+                        onClick={() => setIntroductionProject(project)}
+                      >
+                        <FilePenLine className="size-3.5" />
+                        添加作品简介，让 AI 从开篇提炼
+                      </button>
+                    )}
+                  </div>
+
                   <div className="grid grid-cols-2 border-y border-border/80 bg-secondary/25">
                     <div className="border-r border-border/80 px-5 py-3.5">
                       <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -373,6 +405,16 @@ export function WorksPage({
                       <Button className="flex-1" onClick={() => onSelectProject(project)}>
                         <PenLine className="size-4" />
                         {isActive ? "继续写作" : "选择并写作"}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        className="px-3"
+                        aria-label={`编辑 ${project.name} 的作品简介`}
+                        title="编辑作品简介"
+                        onClick={() => setIntroductionProject(project)}
+                      >
+                        <FilePenLine className="size-4" />
+                        简介
                       </Button>
                       <Button
                         variant="outline"
@@ -599,6 +641,13 @@ export function WorksPage({
           </section>
         </div>
       )}
+
+      <NovelIntroductionDialog
+        open={Boolean(introductionProject)}
+        project={introductionProject}
+        onClose={() => setIntroductionProject(null)}
+        onSaved={onRefresh}
+      />
     </div>
   )
 }

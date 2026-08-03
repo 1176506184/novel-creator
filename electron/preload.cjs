@@ -89,6 +89,12 @@ contextBridge.exposeInMainWorld("authorDesk", {
     get: (projectPath) => ipcRenderer.invoke("characters:get", projectPath),
     summarize: (projectPath) => ipcRenderer.invoke("characters:summarize", projectPath),
   },
+  introduction: {
+    get: (projectPath) => ipcRenderer.invoke("introduction:get", projectPath),
+    save: (projectPath, input) => ipcRenderer.invoke("introduction:save", projectPath, input),
+    generate: (input) => ipcRenderer.invoke("introduction:generate", input),
+    cancel: (requestId) => ipcRenderer.invoke("introduction:cancel", requestId),
+  },
   rules: {
     get: (projectPath) => ipcRenderer.invoke("rules:get", projectPath),
     create: (projectPath, input) => ipcRenderer.invoke("rules:create", projectPath, input),

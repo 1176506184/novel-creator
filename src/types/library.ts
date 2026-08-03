@@ -5,6 +5,9 @@ export type LibraryProject = {
   chapterCount: number
   characterCount: number
   latestChapter: string | null
+  introductionExists: boolean
+  shortTitle: string
+  synopsis: string
   modifiedAt: string
 }
 
@@ -22,6 +25,22 @@ export type CreateProjectResult = {
   createdDirectories: string[]
   existingDirectories: string[]
   library: LibraryState
+}
+
+export type NovelIntroductionState = {
+  ok: boolean
+  exists: boolean
+  path: string
+  shortTitle: string
+  synopsis: string
+  modifiedAt: string | null
+}
+
+export type NovelIntroductionDraft = {
+  shortTitle: string
+  synopsis: string
+  model: string
+  sourceChapterCount: number
 }
 
 export type ChapterSummary = {

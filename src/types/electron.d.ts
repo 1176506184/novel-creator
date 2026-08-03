@@ -23,6 +23,9 @@ type LibraryProject = {
   chapterCount: number
   characterCount: number
   latestChapter: string | null
+  introductionExists: boolean
+  shortTitle: string
+  synopsis: string
   modifiedAt: string
 }
 
@@ -47,6 +50,22 @@ type CreateProjectResult = {
   createdDirectories: string[]
   existingDirectories: string[]
   library: LibraryState
+}
+
+type NovelIntroductionState = {
+  ok: boolean
+  exists: boolean
+  path: string
+  shortTitle: string
+  synopsis: string
+  modifiedAt: string | null
+}
+
+type NovelIntroductionDraft = {
+  shortTitle: string
+  synopsis: string
+  model: string
+  sourceChapterCount: number
 }
 
 type ChapterSummary = {
@@ -469,6 +488,19 @@ declare global {
         summarize(projectPath: string): Promise<CharacterGraphState & {
           model: string
         }>
+      }
+      introduction: {
+        get(projectPath: string): Promise<NovelIntroductionState>
+        save(projectPath: string, input: {
+          shortTitle: string
+          synopsis: string
+        }): Promise<NovelIntroductionState>
+        generate(input: {
+          requestId: string
+          projectPath: string
+          customPrompt?: string
+        }): Promise<NovelIntroductionDraft>
+        cancel(requestId: string): Promise<boolean>
       }
       rules: {
         get(projectPath: string): Promise<WritingRulesState>

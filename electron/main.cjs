@@ -54,6 +54,7 @@ const PROJECT_REQUIRED_DIRECTORIES = [
   "参考小说",
   "范文库",
 ]
+const INTRODUCTION_FILE_NAME = "简介.md"
 
 let mainWindow = null
 let tray = null
@@ -1029,6 +1030,7 @@ const AI_CHAT_SOFT_REVIEW_ROUND = 8
 const AI_CHAT_DUPLICATE_TOOL_LIMIT = 3
 const activeAiChatControllers = new Map()
 const activeBookBreakdownControllers = new Map()
+const activeNovelIntroductionControllers = new Map()
 
 function getAiWrapUpReasoningEffort(reasoningEffort) {
   return ["high", "xhigh", "max", "ultra"].includes(reasoningEffort)
@@ -2182,6 +2184,211 @@ async function readProjectManuscript(projectPath) {
     content: chapters.map((chapter) => (
       `\n\n===== ${chapter.name} =====\n${chapter.content}`
     )).join(""),
+  }
+}
+
+function novelIntroductionPath(projectPath) {
+  if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) {
+    throw new Error("作品目录不在当前小说库中")
+  }
+  return path.join(path.resolve(projectPath), INTRODUCTION_FILE_NAME)
+}
+
+function parseNovelIntroductionMarkdown(content) {
+  const source = String(content || "").replace(/^\uFEFF/, "").trim()
+  if (!source) return { shortTitle: "", synopsis: "" }
+
+  const lines = source.split(/\r?\n/)
+  let shortTitle = ""
+  const explicitTitleIndex = lines.findIndex((line) => (
+    /^\s*\*\*(?:一句话卖点|简短标题)[：:]\*\*\s*/.test(line)
+  ))
+  if (explicitTitleIndex >= 0) {
+    shortTitle = lines[explicitTitleIndex]
+      .replace(/^\s*\*\*(?:一句话卖点|简短标题)[：:]\*\*\s*/, "")
+      .trim()
+    lines.splice(explicitTitleIndex, 1)
+  }
+
+  const firstContentIndex = lines.findIndex((line) => line.trim())
+  if (firstContentIndex >= 0) {
+    const headingMatch = lines[firstContentIndex].match(/^\s*#\s+(.+?)\s*$/)
+    if (headingMatch) {
+      const heading = headingMatch[1].trim()
+      if (!shortTitle && !/^(?:作品)?简介$/.test(heading)) shortTitle = heading
+      lines.splice(firstContentIndex, 1)
+    }
+  }
+
+  const synopsis = lines
+    .filter((line) => !/^\s*#{1,6}\s+(?:作品)?简介\s*$/.test(line))
+    .join("\n")
+    .trim()
+  return {
+    shortTitle: shortTitle.slice(0, 40),
+    synopsis: synopsis.slice(0, 2_000),
+  }
+}
+
+async function getNovelIntroduction(projectPath) {
+  const targetPath = novelIntroductionPath(projectPath)
+  try {
+    const stats = await fs.promises.lstat(targetPath)
+    if (stats.isSymbolicLink() || !stats.isFile()) {
+      throw new Error("简介.md 必须是作品根目录中的普通文件")
+    }
+    if (stats.size > 512 * 1024) throw new Error("简介.md 超过 512KB，无法在软件中编辑")
+    const parsed = parseNovelIntroductionMarkdown(
+      await fs.promises.readFile(targetPath, "utf8"),
+    )
+    return {
+      ok: true,
+      exists: true,
+      path: targetPath,
+      ...parsed,
+      modifiedAt: stats.mtime.toISOString(),
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error
+    return {
+      ok: true,
+      exists: false,
+      path: targetPath,
+      shortTitle: "",
+      synopsis: "",
+      modifiedAt: null,
+    }
+  }
+}
+
+async function saveNovelIntroduction(projectPath, input) {
+  const targetPath = novelIntroductionPath(projectPath)
+  const shortTitle = String(input?.shortTitle || "").trim().replace(/\s+/g, " ")
+  const synopsis = String(input?.synopsis || "").trim()
+  if (shortTitle.length > 40) throw new Error("一句话卖点不能超过 40 个字符")
+  if (!synopsis) throw new Error("作品简介不能为空")
+  if (synopsis.length > 2_000) throw new Error("作品简介不能超过 2000 个字符")
+
+  try {
+    const stats = await fs.promises.lstat(targetPath)
+    if (stats.isSymbolicLink() || !stats.isFile()) {
+      throw new Error("简介.md 必须是作品根目录中的普通文件")
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error
+  }
+
+  const markdown = [
+    "# 作品简介",
+    shortTitle ? `**一句话卖点：** ${shortTitle}` : "",
+    synopsis,
+  ].filter(Boolean).join("\n\n") + "\n"
+  const temporaryPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`
+  await fs.promises.writeFile(temporaryPath, markdown, "utf8")
+  try {
+    await fs.promises.rename(temporaryPath, targetPath)
+  } catch (error) {
+    await fs.promises.unlink(temporaryPath).catch(() => {})
+    throw error
+  }
+  return getNovelIntroduction(projectPath)
+}
+
+async function readNovelIntroductionSource(projectPath) {
+  if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) {
+    throw new Error("作品目录不在当前小说库中")
+  }
+  const normalizedProject = path.resolve(projectPath)
+  const manuscriptPath = path.join(normalizedProject, "正文")
+  let entries = []
+  try {
+    entries = (await fs.promises.readdir(manuscriptPath, { withFileTypes: true }))
+      .filter((entry) => (
+        entry.isFile()
+        && AI_FILE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
+      ))
+      .sort((left, right) => left.name.localeCompare(right.name, "zh-CN", { numeric: true }))
+      .slice(0, 8)
+  } catch (error) {
+    if (error.code === "ENOENT") throw new Error("当前作品还没有正文目录")
+    throw error
+  }
+  if (!entries.length) throw new Error("正文目录中还没有可用于生成简介的章节")
+
+  const realProjectPath = await fs.promises.realpath(normalizedProject)
+  const chapterSections = []
+  let remainingCharacters = 100_000
+  for (const entry of entries) {
+    if (remainingCharacters <= 0) break
+    const realChapterPath = await fs.promises.realpath(path.join(manuscriptPath, entry.name))
+    if (!isPathContained(realProjectPath, realChapterPath)) {
+      throw new Error(`章节文件指向作品目录之外：${entry.name}`)
+    }
+    const chapterContent = (await fs.promises.readFile(realChapterPath, "utf8"))
+      .slice(0, remainingCharacters)
+    remainingCharacters -= chapterContent.length
+    chapterSections.push(`===== ${entry.name} =====\n${chapterContent}`)
+  }
+  const content = chapterSections.join("\n\n")
+  if (content.replace(/\s/g, "").length < 100) {
+    throw new Error("开篇正文内容太少，暂时无法生成可靠简介")
+  }
+  return {
+    projectName: path.basename(normalizedProject),
+    chapterCount: chapterSections.length,
+    content,
+  }
+}
+
+async function requestNovelIntroduction(projectPath, customPromptInput, signal) {
+  const source = await readNovelIntroductionSource(projectPath)
+  const customPrompt = String(customPromptInput || "").trim().slice(0, 500)
+  const config = getApiRuntimeConfig()
+  const endpoint = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`
+  const assistantMessage = await requestAiCompletionWithRetry({
+    endpoint,
+    config,
+    signal,
+    onProgress: () => {},
+    body: JSON.stringify({
+      model: config.model,
+      reasoning_effort: config.reasoningEffort,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "你是网络小说作品包装编辑。根据用户提供的开篇正文生成一句话卖点和作品简介。",
+            "只使用正文中已经出现或能够直接确认的信息，不补写后续结局，不虚构设定。",
+            "一句话卖点控制在 12-28 个中文字符，突出主角、核心处境或最大看点，不要照抄作品名。",
+            "默认将简介控制在 120-240 个中文字符，交代主角、初始处境、核心冲突与悬念，避免剧透后期结果。",
+            "用户可能提供额外生成要求。在不虚构正文事实、不剧透正文未提供内容的前提下，优先遵循其侧重点、语气和篇幅要求。",
+            "不要使用‘本书讲述了’、‘这是一个关于’等空泛开头，不要添加标签、点评或 Markdown。",
+            "只返回严格 JSON：{\"shortTitle\":\"...\",\"synopsis\":\"...\"}",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: [
+            `作品目录名：${source.projectName}`,
+            customPrompt ? `用户额外生成要求：\n${customPrompt}` : "用户没有额外生成要求。",
+            `本次读取开篇 ${source.chapterCount} 章，正文如下：`,
+            source.content,
+          ].join("\n\n"),
+        },
+      ],
+      max_tokens: 1200,
+      stream: true,
+    }),
+  })
+  const parsed = parseBookBreakdownJson(assistantMessage?.content, "作品简介")
+  const shortTitle = safeGraphText(parsed?.shortTitle, "", 40).replace(/\s+/g, " ")
+  const synopsis = safeGraphText(parsed?.synopsis, "", 2_000)
+  if (!shortTitle || !synopsis) throw new Error("AI 返回的作品简介内容不完整")
+  return {
+    shortTitle,
+    synopsis,
+    model: config.model,
+    sourceChapterCount: source.chapterCount,
   }
 }
 
@@ -4435,6 +4642,40 @@ ipcMain.handle("ai:compact-history", (_event, projectPath) => (
 ipcMain.handle("characters:get", (_event, projectPath) => getCharacterGraph(projectPath))
 
 ipcMain.handle("characters:summarize", (_event, projectPath) => requestCharacterSummary(projectPath))
+
+ipcMain.handle("introduction:get", (_event, projectPath) => (
+  getNovelIntroduction(projectPath)
+))
+
+ipcMain.handle("introduction:save", (_event, projectPath, input) => (
+  saveNovelIntroduction(projectPath, input)
+))
+
+ipcMain.handle("introduction:generate", async (event, input) => {
+  const requestId = String(input?.requestId || "")
+  const projectPath = String(input?.projectPath || "")
+  if (!requestId) throw new Error("简介生成请求 ID 无效")
+  const requestKey = `${event.sender.id}:${requestId}`
+  const controller = new AbortController()
+  activeNovelIntroductionControllers.set(requestKey, controller)
+  try {
+    return await requestNovelIntroduction(projectPath, input?.customPrompt, controller.signal)
+  } finally {
+    if (activeNovelIntroductionControllers.get(requestKey) === controller) {
+      activeNovelIntroductionControllers.delete(requestKey)
+    }
+  }
+})
+
+ipcMain.handle("introduction:cancel", (event, requestIdInput) => {
+  const requestId = String(requestIdInput || "")
+  if (!requestId) return false
+  const requestKey = `${event.sender.id}:${requestId}`
+  const controller = activeNovelIntroductionControllers.get(requestKey)
+  if (!controller) return false
+  controller.abort(createAiRequestCanceledError())
+  return true
+})
 
 ipcMain.handle("rules:get", (_event, projectPath) => readWritingRules(projectPath))
 

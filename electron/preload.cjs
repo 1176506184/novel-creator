@@ -149,7 +149,10 @@ contextBridge.exposeInMainWorld("authorDesk", {
     },
   },
   git: {
+    getSettings: (projectPath) => ipcRenderer.invoke("git:get-settings", projectPath),
+    saveSettings: (input) => ipcRenderer.invoke("git:save-settings", input),
     syncProject: (input) => ipcRenderer.invoke("git:sync-project", input),
+    continueSync: (input) => ipcRenderer.invoke("git:continue-sync", input),
     onSyncProgress: (callback) => {
       if (typeof callback !== "function") return () => {}
       const listener = (_event, progress) => callback(progress)

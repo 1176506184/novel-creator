@@ -3,9 +3,11 @@ import {
   Bot,
   CheckCircle2,
   CircleHelp,
+  CloudCog,
   Eye,
   EyeOff,
   FolderOpen,
+  GitBranch,
   KeyRound,
   Library,
   LoaderCircle,
@@ -35,6 +37,14 @@ const defaultApiSettings = {
   hasApiKey: false,
 }
 
+const defaultGitSettings = {
+  remoteUrl: "",
+  branch: "main",
+  authorName: "作者管家",
+  authorEmail: "author-desk@local",
+  username: "",
+}
+
 const fieldClassName = "h-11 w-full rounded-lg border border-input bg-white px-3 text-sm outline-none transition-[border-color,box-shadow] placeholder:text-muted-foreground focus:border-primary/40 focus:ring-3 focus:ring-primary/10"
 
 export function SettingsPage({
@@ -57,6 +67,20 @@ export function SettingsPage({
   const [isSavingCloseBehavior, setIsSavingCloseBehavior] = useState(false)
   const [closeBehaviorMessage, setCloseBehaviorMessage] = useState("")
   const [closeBehaviorError, setCloseBehaviorError] = useState("")
+  const [gitProjectPath, setGitProjectPath] = useState(library.projects[0]?.path || "")
+  const [gitRemoteUrl, setGitRemoteUrl] = useState(defaultGitSettings.remoteUrl)
+  const [gitBranch, setGitBranch] = useState(defaultGitSettings.branch)
+  const [gitAuthorName, setGitAuthorName] = useState(defaultGitSettings.authorName)
+  const [gitAuthorEmail, setGitAuthorEmail] = useState(defaultGitSettings.authorEmail)
+  const [gitUsername, setGitUsername] = useState(defaultGitSettings.username)
+  const [gitToken, setGitToken] = useState("")
+  const [hasGitToken, setHasGitToken] = useState(false)
+  const [showGitToken, setShowGitToken] = useState(false)
+  const [gitRepositoryExists, setGitRepositoryExists] = useState(false)
+  const [isLoadingGit, setIsLoadingGit] = useState(false)
+  const [isSavingGit, setIsSavingGit] = useState(false)
+  const [gitMessage, setGitMessage] = useState("")
+  const [gitError, setGitError] = useState("")
 
   useEffect(() => {
     window.authorDesk.settings.getApi()
@@ -71,6 +95,45 @@ export function SettingsPage({
       })
       .finally(() => setIsLoading(false))
   }, [])
+
+  useEffect(() => {
+    if (!library.projects.length) {
+      setGitProjectPath("")
+      return
+    }
+    if (!library.projects.some((project) => project.path === gitProjectPath)) {
+      setGitProjectPath(library.projects[0].path)
+    }
+  }, [gitProjectPath, library.projects])
+
+  useEffect(() => {
+    let canceled = false
+    setIsLoadingGit(true)
+    setGitMessage("")
+    setGitError("")
+    window.authorDesk.git.getSettings(gitProjectPath)
+      .then((settings) => {
+        if (canceled) return
+        setGitRemoteUrl(settings.remoteUrl)
+        setGitBranch(settings.branch)
+        setGitAuthorName(settings.authorName)
+        setGitAuthorEmail(settings.authorEmail)
+        setGitUsername(settings.username)
+        setHasGitToken(settings.hasToken)
+        setGitRepositoryExists(settings.repositoryExists)
+        setGitToken("")
+      })
+      .catch((loadError) => {
+        if (canceled) return
+        setGitError(loadError instanceof Error ? loadError.message : "无法读取内置 Git 设置")
+      })
+      .finally(() => {
+        if (!canceled) setIsLoadingGit(false)
+      })
+    return () => {
+      canceled = true
+    }
+  }, [gitProjectPath])
 
   useEffect(() => {
     window.authorDesk.window.getCloseBehavior()
@@ -148,13 +211,45 @@ export function SettingsPage({
     }
   }
 
+  async function saveGitSettings(clearToken = false) {
+    if (!gitProjectPath || isSavingGit) return
+    setIsSavingGit(true)
+    setGitMessage("")
+    setGitError("")
+    try {
+      const saved = await window.authorDesk.git.saveSettings({
+        projectPath: gitProjectPath,
+        remoteUrl: gitRemoteUrl,
+        branch: gitBranch,
+        authorName: gitAuthorName,
+        authorEmail: gitAuthorEmail,
+        username: gitUsername,
+        token: gitToken,
+        clearToken,
+      })
+      setGitRemoteUrl(saved.remoteUrl)
+      setGitBranch(saved.branch)
+      setGitAuthorName(saved.authorName)
+      setGitAuthorEmail(saved.authorEmail)
+      setGitUsername(saved.username)
+      setHasGitToken(saved.hasToken)
+      setGitRepositoryExists(saved.repositoryExists)
+      setGitToken("")
+      setGitMessage(clearToken ? "Git 访问令牌已清除" : "内置 Git 已启用，可以直接同步")
+    } catch (saveError) {
+      setGitError(saveError instanceof Error ? saveError.message : "保存内置 Git 设置失败")
+    } finally {
+      setIsSavingGit(false)
+    }
+  }
+
   return (
     <div className="relative mx-auto min-h-full max-w-5xl px-8 py-7 xl:px-10">
       <header>
         <p className="eyebrow">偏好设置</p>
         <h1 className="mt-2 text-2xl font-semibold tracking-[-0.025em]">设置</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          管理小说库位置、窗口关闭行为以及写作助手使用的 AI 接口。
+          管理小说库、窗口关闭行为、内置 Git 同步以及写作助手使用的 AI 接口。
         </p>
       </header>
 
@@ -285,6 +380,169 @@ export function SettingsPage({
                     弹窗中的“记住我的选择”也会同步修改这里。
                   </span>
                 )}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-border bg-white p-6" aria-labelledby="git-settings-title">
+          <div className="flex items-start gap-4">
+            <div className="grid size-11 shrink-0 place-items-center rounded-xl bg-secondary text-primary">
+              <CloudCog className="size-5" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h2 id="git-settings-title" className="text-base font-semibold">内置 Git 同步</h2>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    软件直接管理作品仓库，无需在电脑上安装 Git 或配置外部凭据。
+                  </p>
+                </div>
+                <span className="flex shrink-0 items-center gap-1.5 rounded-full bg-secondary px-3 py-1 text-xs font-medium text-primary">
+                  <GitBranch className="size-3.5" />
+                  内置引擎
+                </span>
+              </div>
+
+              {!library.projects.length ? (
+                <div className="mt-5 rounded-xl border border-dashed border-border bg-muted/25 px-4 py-6 text-center text-sm text-muted-foreground">
+                  请先在小说库中创建或导入一部作品。
+                </div>
+              ) : isLoadingGit ? (
+                <div className="grid h-48 place-items-center">
+                  <LoaderCircle className="size-5 animate-spin text-primary" />
+                </div>
+              ) : (
+                <div className="mt-6 grid grid-cols-2 gap-5">
+                  <label className="col-span-2 block">
+                    <span className="mb-2 block text-sm font-medium">配置作品</span>
+                    <select
+                      value={gitProjectPath}
+                      onChange={(event) => setGitProjectPath(event.target.value)}
+                      className={fieldClassName}
+                    >
+                      {library.projects.map((project) => (
+                        <option key={project.path} value={project.path}>{project.name}</option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="col-span-2 block">
+                    <span className="mb-2 block text-sm font-medium">HTTPS 仓库地址</span>
+                    <input
+                      type="url"
+                      value={gitRemoteUrl}
+                      onChange={(event) => setGitRemoteUrl(event.target.value)}
+                      placeholder="https://github.com/用户名/仓库.git"
+                      className={fieldClassName}
+                    />
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-2 block text-sm font-medium">同步分支</span>
+                    <input
+                      type="text"
+                      value={gitBranch}
+                      onChange={(event) => setGitBranch(event.target.value)}
+                      placeholder="main"
+                      className={fieldClassName}
+                    />
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-2 block text-sm font-medium">远程账号（可选）</span>
+                    <input
+                      type="text"
+                      value={gitUsername}
+                      onChange={(event) => setGitUsername(event.target.value)}
+                      placeholder="GitHub 用户名"
+                      className={fieldClassName}
+                    />
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-2 block text-sm font-medium">提交者名称</span>
+                    <input
+                      type="text"
+                      value={gitAuthorName}
+                      onChange={(event) => setGitAuthorName(event.target.value)}
+                      className={fieldClassName}
+                    />
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-2 block text-sm font-medium">提交者邮箱</span>
+                    <input
+                      type="email"
+                      value={gitAuthorEmail}
+                      onChange={(event) => setGitAuthorEmail(event.target.value)}
+                      className={fieldClassName}
+                    />
+                  </label>
+
+                  <label className="col-span-2 block">
+                    <span className="mb-2 flex items-center justify-between gap-3 text-sm font-medium">
+                      <span>访问令牌</span>
+                      <span className="flex items-center gap-1 text-[11px] font-normal text-muted-foreground">
+                        <ShieldCheck className="size-3.5 text-success" />
+                        使用系统安全存储加密
+                      </span>
+                    </span>
+                    <div className="relative">
+                      <KeyRound className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                      <input
+                        type={showGitToken ? "text" : "password"}
+                        value={gitToken}
+                        onChange={(event) => setGitToken(event.target.value)}
+                        autoComplete="off"
+                        placeholder={hasGitToken ? "已安全配置；留空将保留原令牌" : "粘贴仓库访问令牌"}
+                        className={`${fieldClassName} pl-10 pr-11`}
+                      />
+                      <button
+                        type="button"
+                        className="absolute right-1.5 top-1/2 grid size-8 -translate-y-1/2 place-items-center rounded-full text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+                        aria-label={showGitToken ? "隐藏访问令牌" : "显示访问令牌"}
+                        onClick={() => setShowGitToken((current) => !current)}
+                      >
+                        {showGitToken ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                      </button>
+                    </div>
+                  </label>
+                </div>
+              )}
+
+              <div className="mt-6 flex items-center justify-between gap-4 border-t border-border pt-5">
+                <div className="min-h-5 text-xs" aria-live="polite">
+                  {gitError ? (
+                    <span className="text-destructive">{gitError}</span>
+                  ) : gitMessage ? (
+                    <span className="text-success">{gitMessage}</span>
+                  ) : (
+                    <span className="text-muted-foreground">
+                      {gitRepositoryExists ? "已识别作品仓库；同步时会先合并云端更新。" : "保存后会在作品目录自动初始化仓库。"}
+                    </span>
+                  )}
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {hasGitToken && (
+                    <Button
+                      variant="ghost"
+                      className="text-muted-foreground hover:text-destructive"
+                      disabled={isSavingGit}
+                      onClick={() => saveGitSettings(true)}
+                    >
+                      <Trash2 className="size-4" />
+                      清除令牌
+                    </Button>
+                  )}
+                  <Button
+                    disabled={!gitProjectPath || isLoadingGit || isSavingGit}
+                    onClick={() => saveGitSettings(false)}
+                  >
+                    {isSavingGit ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+                    {isSavingGit ? "保存中" : "保存并启用"}
+                  </Button>
+                </div>
               </div>
             </div>
           </div>

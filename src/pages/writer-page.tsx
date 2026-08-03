@@ -151,10 +151,10 @@ function isUnrecoverableAiChangeError(error: unknown) {
 function formatGitSyncError(error: unknown) {
   const rawMessage = error instanceof Error ? error.message : String(error || "")
   const message = rawMessage
-    .replace(/^Error invoking remote method ['"]git:sync-project['"]:\s*/i, "")
+    .replace(/^Error invoking remote method ['"]git:(?:sync-project|continue-sync)['"]:\s*/i, "")
     .replace(/^Error:\s*/i, "")
   if (/authentication failed|could not read username|permission denied.*publickey/i.test(message)) {
-    return "Git 身份验证失败，请先在系统 Git 中配置可用的凭据、令牌或 SSH Key。"
+    return "Git 身份验证失败，请在设置的“内置 Git 同步”中检查账号和访问令牌。"
   }
   if (/repository not found/i.test(message)) {
     return "远程 Git 仓库不存在，或当前账号没有访问权限。"
@@ -819,6 +819,41 @@ export function WriterPage({
       setGitSyncError(formatGitSyncError(syncError))
       setGitSyncLabel("同步失败")
       setIsGitSyncDialogOpen(true)
+    } finally {
+      if (activeGitSyncRequestIdRef.current === requestId) {
+        activeGitSyncRequestIdRef.current = ""
+      }
+      setIsGitSyncing(false)
+    }
+  }
+
+  async function continueGitSync() {
+    if (!project || isGitSyncing) return
+    const requestId = `git-continue-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    activeGitSyncRequestIdRef.current = requestId
+    setIsGitSyncing(true)
+    setGitSyncLabel("继续同步")
+    setGitSyncError("")
+    try {
+      const result = await window.authorDesk.git.continueSync({
+        requestId,
+        projectPath: project.path,
+      })
+      setGitSyncResult(result)
+      if (result.status === "conflict") {
+        setGitSyncLabel("有冲突")
+        return
+      }
+      await refreshAfterGitSync()
+      setIsGitSyncDialogOpen(false)
+      setGitSyncLabel("已同步")
+      gitSyncResetTimerRef.current = window.setTimeout(() => {
+        setGitSyncLabel("同步")
+        gitSyncResetTimerRef.current = null
+      }, 3500)
+    } catch (syncError) {
+      setGitSyncError(formatGitSyncError(syncError))
+      setGitSyncLabel("同步失败")
     } finally {
       if (activeGitSyncRequestIdRef.current === requestId) {
         activeGitSyncRequestIdRef.current = ""
@@ -2103,31 +2138,34 @@ export function WriterPage({
                 <section className="rounded-xl border border-border p-4">
                   <h3 className="text-xs font-semibold">手动处理步骤</h3>
                   <ol className="mt-3 list-decimal space-y-2 pl-4 text-[11px] leading-5 text-muted-foreground">
-                    <li>打开作品目录，合并上面列出的冲突文件并保存。</li>
-                    <li>
-                      在该目录执行 <code className="rounded bg-muted px-1 py-0.5">git add -A</code>。
-                    </li>
-                    <li>
-                      {gitSyncResult.operation === "merge"
-                        ? "完成合并提交后，再点击同步按钮。"
-                        : (
-                          <>
-                            执行 <code className="rounded bg-muted px-1 py-0.5">git rebase --continue</code>，
-                            完成后再点击同步。
-                          </>
-                        )}
-                    </li>
+                    <li>打开作品目录，编辑上面列出的冲突文件。</li>
+                    <li>保留需要的内容，删除文件中的冲突标记，然后保存。</li>
+                    <li>回到这里点击“已处理，继续同步”，软件会自动完成提交和推送。</li>
                   </ol>
                 </section>
               )}
             </div>
 
             <footer className="flex justify-end gap-2 border-t border-border bg-muted/25 px-5 py-3">
-              <Button variant="outline" onClick={() => onOpenProjectFolder(project)}>
+              <Button
+                variant="outline"
+                disabled={isGitSyncing}
+                onClick={() => onOpenProjectFolder(project)}
+              >
                 <FolderOpen className="size-4" />
                 打开作品目录
               </Button>
-              <Button onClick={() => setIsGitSyncDialogOpen(false)}>知道了</Button>
+              {gitSyncResult?.status === "conflict" ? (
+                <Button disabled={isGitSyncing} onClick={continueGitSync}>
+                  {isGitSyncing ? <LoaderCircle className="size-4 animate-spin" /> : <CloudUpload className="size-4" />}
+                  {isGitSyncing ? "正在继续" : "已处理，继续同步"}
+                </Button>
+              ) : (
+                <>
+                  <Button variant="outline" onClick={onOpenSettings}>打开 Git 设置</Button>
+                  <Button onClick={() => setIsGitSyncDialogOpen(false)}>知道了</Button>
+                </>
+              )}
             </footer>
           </section>
         </div>

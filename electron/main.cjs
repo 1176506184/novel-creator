@@ -2,6 +2,8 @@ const path = require("node:path")
 const fs = require("node:fs")
 const { createHash, randomUUID } = require("node:crypto")
 const { spawn } = require("node:child_process")
+const git = require("isomorphic-git")
+const gitHttp = require("isomorphic-git/http/node")
 const {
   app,
   BrowserWindow,
@@ -31,6 +33,11 @@ const DEFAULT_API_CONFIG = {
   baseUrl: "https://ai98pro.xyz/v1",
   model: "gpt-5.6-sol",
   reasoningEffort: "high",
+}
+const DEFAULT_GIT_CONFIG = {
+  authorName: "作者管家",
+  authorEmail: "author-desk@local",
+  username: "",
 }
 const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"])
 const CLOSE_BEHAVIORS = new Set(["ask", "tray", "quit"])
@@ -180,6 +187,78 @@ function getApiRuntimeConfig() {
   return {
     ...getApiConfig(),
     apiKey,
+  }
+}
+
+function getStoredGitConfig() {
+  const stored = readDesktopSettings().git || {}
+  return {
+    authorName: typeof stored.authorName === "string" && stored.authorName.trim()
+      ? stored.authorName.trim()
+      : DEFAULT_GIT_CONFIG.authorName,
+    authorEmail: typeof stored.authorEmail === "string" && stored.authorEmail.trim()
+      ? stored.authorEmail.trim()
+      : DEFAULT_GIT_CONFIG.authorEmail,
+    username: typeof stored.username === "string" ? stored.username.trim() : "",
+    tokenEncrypted: typeof stored.tokenEncrypted === "string" && stored.tokenEncrypted
+      ? stored.tokenEncrypted
+      : null,
+  }
+}
+
+function getGitRuntimeConfig(requireToken = false) {
+  const stored = getStoredGitConfig()
+  let token = ""
+  if (stored.tokenEncrypted) {
+    if (!safeStorage.isEncryptionAvailable()) throw new Error("当前系统无法解密 Git 访问令牌")
+    try {
+      token = safeStorage.decryptString(Buffer.from(stored.tokenEncrypted, "base64"))
+    } catch {
+      throw new Error("Git 访问令牌解密失败，请在设置中重新保存")
+    }
+  }
+  if (requireToken && !token) throw new Error("请先在设置中配置 Git 访问令牌")
+  return {
+    ...stored,
+    token,
+  }
+}
+
+function saveStoredGitConfig(input) {
+  if (!input || typeof input !== "object") throw new Error("Git 设置无效")
+  const authorName = String(input.authorName || "").trim()
+  const authorEmail = String(input.authorEmail || "").trim()
+  const username = String(input.username || "").trim()
+  if (!authorName || authorName.length > 120) throw new Error("Git 提交名称无效")
+  if (!/^\S+@\S+\.\S+$/.test(authorEmail) || authorEmail.length > 200) {
+    throw new Error("Git 提交邮箱格式无效")
+  }
+  if (username.length > 120) throw new Error("Git 账号不能超过 120 个字符")
+
+  const previous = getStoredGitConfig()
+  let tokenEncrypted = previous.tokenEncrypted
+  const token = typeof input.token === "string" ? input.token.trim() : ""
+  if (input.clearToken === true) {
+    tokenEncrypted = null
+  } else if (token) {
+    if (!safeStorage.isEncryptionAvailable()) {
+      throw new Error("当前系统暂时无法安全保存 Git 访问令牌")
+    }
+    tokenEncrypted = safeStorage.encryptString(token).toString("base64")
+  }
+  writeDesktopSettings({
+    git: {
+      authorName,
+      authorEmail,
+      username,
+      tokenEncrypted,
+    },
+  })
+  return {
+    authorName,
+    authorEmail,
+    username,
+    hasToken: Boolean(tokenEncrypted),
   }
 }
 
@@ -4173,6 +4252,421 @@ async function chooseAndCreateLibraryProject() {
   }
 }
 
+function normalizeBuiltinGitRemoteUrl(input) {
+  const remoteUrl = String(input || "").trim()
+  if (!remoteUrl) throw new Error("请填写 Git HTTPS 远程仓库地址")
+  let parsedUrl
+  try {
+    parsedUrl = new URL(remoteUrl)
+  } catch {
+    throw new Error("Git 远程仓库地址无效")
+  }
+  if (parsedUrl.protocol !== "https:") throw new Error("内置 Git 当前只支持 HTTPS 远程仓库")
+  if (parsedUrl.username || parsedUrl.password) {
+    throw new Error("请勿把账号或令牌写进仓库地址，请使用下方安全令牌设置")
+  }
+  return remoteUrl.replace(/\/+$/, "")
+}
+
+async function resolveBuiltinGitProject(projectPathInput) {
+  if (typeof projectPathInput !== "string" || !isPathInsideLibrary(projectPathInput)) {
+    throw new Error("作品目录不在当前小说库中")
+  }
+  const projectPath = path.resolve(projectPathInput)
+  const stats = await fs.promises.stat(projectPath)
+  if (!stats.isDirectory()) throw new Error("当前作品路径不是文件夹")
+  return projectPath
+}
+
+function builtinGitRepositoryExists(projectPath) {
+  try {
+    const stats = fs.statSync(path.join(projectPath, ".git"))
+    return stats.isDirectory()
+  } catch {
+    return false
+  }
+}
+
+async function getBuiltinGitBranch(projectPath) {
+  const branch = await git.currentBranch({ fs, dir: projectPath, fullname: false })
+    .catch(() => "")
+  if (branch) return branch
+  try {
+    const head = await fs.promises.readFile(path.join(projectPath, ".git", "HEAD"), "utf8")
+    const match = head.trim().match(/^ref:\s+refs\/heads\/(.+)$/)
+    return match?.[1] || ""
+  } catch {
+    return ""
+  }
+}
+
+async function getBuiltinGitSettings(projectPathInput = "") {
+  const stored = getStoredGitConfig()
+  if (!projectPathInput) {
+    return {
+      engine: "builtin",
+      projectPath: "",
+      repositoryExists: false,
+      remoteUrl: "",
+      branch: "main",
+      authorName: stored.authorName,
+      authorEmail: stored.authorEmail,
+      username: stored.username,
+      hasToken: Boolean(stored.tokenEncrypted),
+    }
+  }
+  const projectPath = await resolveBuiltinGitProject(projectPathInput)
+  const repositoryExists = builtinGitRepositoryExists(projectPath)
+  let remoteUrl = ""
+  let branch = "main"
+  let authorName = stored.authorName
+  let authorEmail = stored.authorEmail
+  if (repositoryExists) {
+    const [remotes, currentBranch, repoAuthorName, repoAuthorEmail] = await Promise.all([
+      git.listRemotes({ fs, dir: projectPath }).catch(() => []),
+      getBuiltinGitBranch(projectPath),
+      git.getConfig({ fs, dir: projectPath, path: "user.name" }).catch(() => ""),
+      git.getConfig({ fs, dir: projectPath, path: "user.email" }).catch(() => ""),
+    ])
+    const remote = remotes.find((item) => item.remote === "origin") || remotes[0]
+    remoteUrl = remote?.url || ""
+    branch = currentBranch || "main"
+    authorName = repoAuthorName || authorName
+    authorEmail = repoAuthorEmail || authorEmail
+  }
+  return {
+    engine: "builtin",
+    projectPath,
+    repositoryExists,
+    remoteUrl,
+    branch,
+    authorName,
+    authorEmail,
+    username: stored.username,
+    hasToken: Boolean(stored.tokenEncrypted),
+  }
+}
+
+async function saveBuiltinGitSettings(input) {
+  const projectPath = await resolveBuiltinGitProject(String(input?.projectPath || ""))
+  const remoteUrl = normalizeBuiltinGitRemoteUrl(input?.remoteUrl)
+  const branch = String(input?.branch || "main").trim()
+  const invalidBranchCharacters = ["~", "^", ":", "?", "*", "[", "\\"]
+  if (
+    !branch
+    || branch.length > 120
+    || /\s/.test(branch)
+    || invalidBranchCharacters.some((character) => branch.includes(character))
+    || branch.includes("..")
+    || branch.includes("//")
+    || branch.includes("@{")
+    || branch.startsWith("/")
+    || branch.endsWith("/")
+    || branch.endsWith(".")
+  ) {
+    throw new Error("Git 分支名称无效")
+  }
+  const savedIdentity = saveStoredGitConfig(input)
+  if (!builtinGitRepositoryExists(projectPath)) {
+    await git.init({ fs, dir: projectPath, defaultBranch: branch })
+  }
+  const currentBranch = await getBuiltinGitBranch(projectPath)
+  if (currentBranch && currentBranch !== branch) {
+    throw new Error(`当前仓库正在使用 ${currentBranch} 分支，请填写相同分支`)
+  }
+  await Promise.all([
+    git.setConfig({ fs, dir: projectPath, path: "user.name", value: savedIdentity.authorName }),
+    git.setConfig({ fs, dir: projectPath, path: "user.email", value: savedIdentity.authorEmail }),
+  ])
+  await git.addRemote({
+    fs,
+    dir: projectPath,
+    remote: "origin",
+    url: remoteUrl,
+    force: true,
+  })
+  await git.setConfig({ fs, dir: projectPath, path: `branch.${branch}.remote`, value: "origin" })
+  await git.setConfig({ fs, dir: projectPath, path: `branch.${branch}.merge`, value: `refs/heads/${branch}` })
+  return getBuiltinGitSettings(projectPath)
+}
+
+function builtinGitAuth(config) {
+  return () => config.token
+    ? {
+        username: config.username || config.token,
+        password: config.token,
+      }
+    : {}
+}
+
+function builtinGitErrorMessage(error, fallback = "内置 Git 操作失败") {
+  const message = error instanceof Error ? error.message : String(error || "")
+  if (/401|403|authentication|authorization|credential|access denied/i.test(message)) {
+    return "Git 身份验证失败，请在设置中检查账号和访问令牌"
+  }
+  if (/404|not found|repository.*not found/i.test(message)) {
+    return "远程 Git 仓库不存在，或当前令牌没有访问权限"
+  }
+  if (/ECONN|ENOTFOUND|fetch failed|network|socket|timeout/i.test(message)) {
+    return "无法连接远程 Git 仓库，请检查网络后重试"
+  }
+  return message || fallback
+}
+
+function builtinGitConflictPath(projectPath) {
+  return path.join(projectPath, ".git", "author-desk-conflict.json")
+}
+
+async function readBuiltinGitConflict(projectPath) {
+  try {
+    return JSON.parse(await fs.promises.readFile(builtinGitConflictPath(projectPath), "utf8"))
+  } catch (error) {
+    if (error.code === "ENOENT") return null
+    throw error
+  }
+}
+
+async function writeBuiltinGitConflict(projectPath, state) {
+  await fs.promises.writeFile(
+    builtinGitConflictPath(projectPath),
+    `${JSON.stringify(state, null, 2)}\n`,
+    "utf8",
+  )
+}
+
+function normalizeBuiltinConflictFiles(error) {
+  const data = error?.data
+  const rawFiles = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.filepaths)
+      ? data.filepaths
+      : []
+  return [...new Set(rawFiles.map((item) => String(item || "").trim()).filter(Boolean))]
+}
+
+async function stageAllBuiltinGitChanges(projectPath) {
+  const matrix = await git.statusMatrix({ fs, dir: projectPath })
+  for (const [filepath, , workdirStatus] of matrix) {
+    if (workdirStatus === 0) await git.remove({ fs, dir: projectPath, filepath })
+    else await git.add({ fs, dir: projectPath, filepath })
+  }
+  const stagedMatrix = await git.statusMatrix({ fs, dir: projectPath })
+  return stagedMatrix.some(([, headStatus, , stageStatus]) => headStatus !== stageStatus)
+}
+
+function builtinGitCommitMessage() {
+  const commitTime = new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(new Date())
+  return `作者管家自动同步 ${commitTime}`
+}
+
+async function pushBuiltinGit(projectPath, branch, remoteUrl, config, onProgress) {
+  onProgress({ phase: "pushing", label: "内置 Git 正在推送到云端…" })
+  await git.push({
+    fs,
+    http: gitHttp,
+    dir: projectPath,
+    remote: "origin",
+    ref: branch,
+    remoteRef: branch,
+    url: remoteUrl,
+    force: false,
+    onAuth: builtinGitAuth(config),
+  })
+}
+
+async function syncProjectWithBuiltinGit(projectPathInput, onProgress = () => {}) {
+  const projectPath = await resolveBuiltinGitProject(projectPathInput)
+  if (!builtinGitRepositoryExists(projectPath)) {
+    throw new Error("当前作品还没有启用内置 Git，请先在设置中完成配置")
+  }
+  const settings = await getBuiltinGitSettings(projectPath)
+  const remoteUrl = normalizeBuiltinGitRemoteUrl(settings.remoteUrl)
+  const branch = settings.branch || "main"
+  const config = getGitRuntimeConfig(true)
+  const author = { name: config.authorName, email: config.authorEmail }
+  const existingConflict = await readBuiltinGitConflict(projectPath)
+  if (existingConflict) {
+    return {
+      ok: false,
+      status: "conflict",
+      branch,
+      operation: "merge",
+      conflictFiles: existingConflict.conflictFiles || [],
+      message: "检测到尚未完成的内置 Git 合并，请处理冲突后点击继续同步",
+    }
+  }
+
+  onProgress({ phase: "checking", label: "正在检查内置 Git 仓库…" })
+  const hasChanges = await stageAllBuiltinGitChanges(projectPath)
+  const hasHead = await git.resolveRef({ fs, dir: projectPath, ref: "HEAD" })
+    .then(() => true)
+    .catch(() => false)
+  let committed = false
+  if (hasChanges || !hasHead) {
+    onProgress({ phase: "committing", label: "内置 Git 正在提交本地变化…" })
+    await git.commit({
+      fs,
+      dir: projectPath,
+      ref: branch,
+      message: builtinGitCommitMessage(),
+      author,
+    })
+    committed = true
+  }
+
+  onProgress({ phase: "fetching", label: "内置 Git 正在检查云端分支…" })
+  let remoteBranchExists = false
+  try {
+    const remoteRefs = await git.listServerRefs({
+      http: gitHttp,
+      url: remoteUrl,
+      prefix: `refs/heads/${branch}`,
+      onAuth: builtinGitAuth(config),
+    })
+    remoteBranchExists = remoteRefs.some((item) => item.ref === `refs/heads/${branch}`)
+  } catch (error) {
+    throw new Error(builtinGitErrorMessage(error, "无法检查远程分支"))
+  }
+
+  if (remoteBranchExists) {
+    onProgress({ phase: "pulling", label: "内置 Git 正在拉取并合并云端更新…" })
+    try {
+      await git.fetch({
+        fs,
+        http: gitHttp,
+        dir: projectPath,
+        remote: "origin",
+        ref: branch,
+        singleBranch: true,
+        onAuth: builtinGitAuth(config),
+      })
+      const oursOid = await git.resolveRef({ fs, dir: projectPath, ref: branch })
+      const remoteRef = `refs/remotes/origin/${branch}`
+      const theirsOid = await git.resolveRef({ fs, dir: projectPath, ref: remoteRef })
+      try {
+        await git.merge({
+          fs,
+          dir: projectPath,
+          ours: branch,
+          theirs: remoteRef,
+          author,
+          abortOnConflict: false,
+        })
+      } catch (error) {
+        const conflictFiles = normalizeBuiltinConflictFiles(error)
+        if (!conflictFiles.length && error?.name !== "MergeConflictError") throw error
+        await writeBuiltinGitConflict(projectPath, {
+          branch,
+          remote: "origin",
+          remoteUrl,
+          oursOid,
+          theirsOid,
+          conflictFiles,
+          createdAt: new Date().toISOString(),
+        })
+        return {
+          ok: false,
+          status: "conflict",
+          branch,
+          operation: "merge",
+          conflictFiles,
+          message: "拉取云端更新时发生冲突，请手动编辑冲突文件后在软件中继续同步",
+        }
+      }
+    } catch (error) {
+      if (error?.name === "MergeConflictError") throw error
+      throw new Error(builtinGitErrorMessage(error, "拉取云端更新失败"))
+    }
+  }
+
+  try {
+    await pushBuiltinGit(projectPath, branch, remoteUrl, config, onProgress)
+  } catch (error) {
+    throw new Error(builtinGitErrorMessage(error, "推送到云端失败"))
+  }
+  onProgress({ phase: "complete", label: "作品已通过内置 Git 同步" })
+  return {
+    ok: true,
+    status: "synced",
+    branch,
+    remote: `origin/${branch}`,
+    committed,
+    conflictFiles: [],
+    operation: "",
+    message: "本地变化已提交，云端更新已合并并完成推送",
+    syncedAt: new Date().toISOString(),
+  }
+}
+
+async function continueBuiltinGitSync(projectPathInput, onProgress = () => {}) {
+  const projectPath = await resolveBuiltinGitProject(projectPathInput)
+  const conflict = await readBuiltinGitConflict(projectPath)
+  if (!conflict) throw new Error("当前没有等待处理的内置 Git 冲突")
+  const unresolvedFiles = []
+  for (const filepath of conflict.conflictFiles || []) {
+    try {
+      const content = await fs.promises.readFile(path.join(projectPath, filepath), "utf8")
+      if (/^(?:<{7}|={7}|>{7})/m.test(content)) unresolvedFiles.push(filepath)
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error
+    }
+  }
+  if (unresolvedFiles.length) {
+    return {
+      ok: false,
+      status: "conflict",
+      branch: conflict.branch,
+      operation: "merge",
+      conflictFiles: unresolvedFiles,
+      message: "仍检测到冲突标记，请完成编辑并保存文件后再继续",
+    }
+  }
+  const config = getGitRuntimeConfig(true)
+  const author = { name: config.authorName, email: config.authorEmail }
+  if (!conflict.mergeCommitOid) {
+    onProgress({ phase: "committing", label: "正在提交已处理的冲突…" })
+    await stageAllBuiltinGitChanges(projectPath)
+    const mergeCommitOid = await git.commit({
+      fs,
+      dir: projectPath,
+      ref: conflict.branch,
+      message: `合并 origin/${conflict.branch}`,
+      author,
+      parent: [conflict.oursOid, conflict.theirsOid],
+    })
+    conflict.mergeCommitOid = mergeCommitOid
+    await writeBuiltinGitConflict(projectPath, conflict)
+  }
+  await pushBuiltinGit(
+    projectPath,
+    conflict.branch,
+    conflict.remoteUrl,
+    config,
+    onProgress,
+  )
+  await fs.promises.unlink(builtinGitConflictPath(projectPath)).catch(() => {})
+  onProgress({ phase: "complete", label: "冲突已处理并同步到云端" })
+  return {
+    ok: true,
+    status: "synced",
+    branch: conflict.branch,
+    remote: `origin/${conflict.branch}`,
+    committed: true,
+    conflictFiles: [],
+    operation: "",
+    message: "冲突合并已提交并推送",
+    syncedAt: new Date().toISOString(),
+  }
+}
+
 function gitCommandErrorMessage(result, fallback) {
   const message = String(result?.stderr || result?.stdout || "")
     .trim()
@@ -4571,9 +5065,26 @@ ipcMain.handle("library:rename-project", (_event, projectPath, nextName) => (
 
 ipcMain.handle("library:create-project", () => chooseAndCreateLibraryProject())
 
+ipcMain.handle("git:get-settings", (_event, projectPath) => (
+  getBuiltinGitSettings(String(projectPath || ""))
+))
+
+ipcMain.handle("git:save-settings", (_event, input) => saveBuiltinGitSettings(input))
+
 ipcMain.handle("git:sync-project", (event, input) => {
   const requestId = String(input?.requestId || "")
-  return syncProjectWithGit(String(input?.projectPath || ""), (progress) => {
+  return syncProjectWithBuiltinGit(String(input?.projectPath || ""), (progress) => {
+    if (event.sender.isDestroyed()) return
+    event.sender.send("git:sync-progress", {
+      requestId,
+      ...progress,
+    })
+  })
+})
+
+ipcMain.handle("git:continue-sync", (event, input) => {
+  const requestId = String(input?.requestId || "")
+  return continueBuiltinGitSync(String(input?.projectPath || ""), (progress) => {
     if (event.sender.isDestroyed()) return
     event.sender.send("git:sync-progress", {
       requestId,

@@ -407,6 +407,18 @@ type GitSyncResult = {
   syncedAt?: string
 }
 
+type GitSettings = {
+  engine: "builtin"
+  projectPath: string
+  repositoryExists: boolean
+  remoteUrl: string
+  branch: string
+  authorName: string
+  authorEmail: string
+  username: string
+  hasToken: boolean
+}
+
 declare global {
   interface Window {
     authorDesk: {
@@ -555,7 +567,22 @@ declare global {
         onProgress(callback: (progress: StyleComparisonProgress) => void): () => void
       }
       git: {
+        getSettings(projectPath: string): Promise<GitSettings>
+        saveSettings(input: {
+          projectPath: string
+          remoteUrl: string
+          branch: string
+          authorName: string
+          authorEmail: string
+          username: string
+          token?: string
+          clearToken?: boolean
+        }): Promise<GitSettings>
         syncProject(input: {
+          requestId: string
+          projectPath: string
+        }): Promise<GitSyncResult>
+        continueSync(input: {
           requestId: string
           projectPath: string
         }): Promise<GitSyncResult>

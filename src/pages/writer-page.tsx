@@ -1736,7 +1736,7 @@ export function WriterPage({
                       <summary className="cursor-pointer select-none font-medium text-primary">
                         已自动压缩 {aiCompactedCount} 条早期消息
                       </summary>
-                      <p className="mt-2 whitespace-pre-wrap leading-5 text-muted-foreground">
+                      <p className="mt-2 select-text whitespace-pre-wrap leading-5 text-muted-foreground">
                         {aiChatSummary}
                       </p>
                     </details>
@@ -1797,7 +1797,7 @@ export function WriterPage({
                             </div>
                           </div>
                         ) : (
-                          <p className="whitespace-pre-wrap break-words text-xs leading-5">
+                          <p className="select-text whitespace-pre-wrap break-words text-xs leading-5">
                             {message.role === "assistant"
                               ? formatAiDisplayContent(message.content)
                               : message.content}
@@ -1807,7 +1807,7 @@ export function WriterPage({
 
                         {message.role === "assistant" && message.diagnostics && (
                           <p
-                            className="mt-2 text-[9px] text-muted-foreground/80"
+                            className="mt-2 select-text text-[9px] text-muted-foreground/80"
                             title={`模型等待 ${formatAiDuration(message.diagnostics.modelDurationMs)} · 本地工具 ${formatAiDuration(message.diagnostics.toolDurationMs)}`}
                           >
                             用时 {formatAiDuration(message.diagnostics.elapsedMs)}
@@ -1909,11 +1909,11 @@ export function WriterPage({
                   role="status"
                 >
                   <Check className="mt-0.5 size-3.5 shrink-0" />
-                  <span>{aiNotice}</span>
+                  <span className="select-text">{aiNotice}</span>
                 </div>
               )}
               {aiError && (
-                <div className="mb-2 rounded-lg bg-red-50 px-3 py-2 text-[11px] leading-4 text-destructive" role="alert">
+                <div className="mb-2 select-text rounded-lg bg-red-50 px-3 py-2 text-[11px] leading-4 text-destructive" role="alert">
                   {aiError}
                 </div>
               )}

@@ -104,7 +104,7 @@ export function NovelIntroductionDialog({
   })
 
   async function generateIntroduction() {
-    if (!project || isGenerating) return
+    if (!project || isGenerating || requestIdRef.current) return
     if (isDirty && !window.confirm("AI 生成会替换当前未保存内容，确定继续吗？")) return
     const requestId = `introduction-${Date.now()}-${Math.random().toString(36).slice(2)}`
     requestIdRef.current = requestId
@@ -126,8 +126,8 @@ export function NovelIntroductionDialog({
     } finally {
       if (requestIdRef.current === requestId) {
         requestIdRef.current = ""
-        setIsGenerating(false)
       }
+      setIsGenerating(false)
     }
   }
 

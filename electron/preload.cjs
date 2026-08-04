@@ -65,6 +65,8 @@ contextBridge.exposeInMainWorld("authorDesk", {
   },
   ai: {
     chat: (input) => ipcRenderer.invoke("ai:chat", input),
+    steerChat: (input) => ipcRenderer.invoke("ai:steer-chat", input),
+    removeSteer: (input) => ipcRenderer.invoke("ai:remove-steer", input),
     cancelChat: (requestId) => ipcRenderer.invoke("ai:cancel-chat", requestId),
     applyChanges: (projectPath, changeSetId) => (
       ipcRenderer.invoke("ai:apply-changes", projectPath, changeSetId)

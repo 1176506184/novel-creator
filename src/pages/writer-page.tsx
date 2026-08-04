@@ -16,6 +16,7 @@ import {
   Check,
   ChevronDown,
   CircleAlert,
+  Clock3,
   CloudUpload,
   Copy,
   FileText,
@@ -98,6 +99,13 @@ type ChapterContextMenu = {
 type AiToolSyncEvent = {
   id: number
   event: AiToolEvent
+}
+
+type AiQueuedPrompt = {
+  id: string
+  content: string
+  status: "waiting" | "guiding" | "received"
+  requestId?: string
 }
 
 const numberFormatter = new Intl.NumberFormat("zh-CN")
@@ -374,6 +382,8 @@ export function WriterPage({
   const [aiChatSummary, setAiChatSummary] = useState("")
   const [aiCompactedCount, setAiCompactedCount] = useState(0)
   const [aiInput, setAiInput] = useState("")
+  const [aiQueuedPrompts, setAiQueuedPrompts] = useState<AiQueuedPrompt[]>([])
+  const [isAiQueuePaused, setIsAiQueuePaused] = useState(false)
   const [aiError, setAiError] = useState("")
   const [aiNotice, setAiNotice] = useState("")
   const [isAiThinking, setIsAiThinking] = useState(false)
@@ -402,6 +412,7 @@ export function WriterPage({
   const activeAiRequestIdRef = useRef("")
   const activeAiMessageIdRef = useRef("")
   const aiMessagesRef = useRef<AiMessage[]>([])
+  const aiQueuedPromptsRef = useRef<AiQueuedPrompt[]>([])
   const activeGitSyncRequestIdRef = useRef("")
   const gitSyncResetTimerRef = useRef<number | null>(null)
   const isDirtyRef = useRef(false)
@@ -419,6 +430,16 @@ export function WriterPage({
       : updater
     aiMessagesRef.current = nextMessages
     setAiMessages(nextMessages)
+  }, [])
+
+  const updateAiQueuedPrompts = useCallback((
+    updater: AiQueuedPrompt[] | ((current: AiQueuedPrompt[]) => AiQueuedPrompt[]),
+  ) => {
+    const nextPrompts = typeof updater === "function"
+      ? updater(aiQueuedPromptsRef.current)
+      : updater
+    aiQueuedPromptsRef.current = nextPrompts
+    setAiQueuedPrompts(nextPrompts)
   }, [])
 
   useEffect(() => {
@@ -489,6 +510,13 @@ export function WriterPage({
 
   useEffect(() => window.authorDesk.ai.onChatProgress((progress) => {
     if (!progress.requestId || progress.requestId !== activeAiRequestIdRef.current) return
+    if (progress.type === "steer-consumed" && progress.steerId) {
+      updateAiQueuedPrompts((current) => current.map((prompt) => (
+        prompt.id === progress.steerId
+          ? { ...prompt, status: "received" }
+          : prompt
+      )))
+    }
     const messageId = activeAiMessageIdRef.current
     if (!messageId) return
     if (
@@ -530,7 +558,7 @@ export function WriterPage({
       }
       return message
     }))
-  }), [updateAiMessages])
+  }), [updateAiMessages, updateAiQueuedPrompts])
 
   useEffect(() => window.authorDesk.git.onSyncProgress((progress) => {
     if (
@@ -638,6 +666,10 @@ export function WriterPage({
   }, [aiToolSyncEvent])
 
   useEffect(() => {
+    const previousAiRequestId = activeAiRequestIdRef.current
+    if (previousAiRequestId) {
+      window.authorDesk.ai.cancelChat(previousAiRequestId).catch(() => {})
+    }
     shouldInstantAiScrollRef.current = true
     setChapters([])
     setActiveChapterName("")
@@ -659,8 +691,11 @@ export function WriterPage({
     setAiChatSummary("")
     setAiCompactedCount(0)
     setAiInput("")
+    updateAiQueuedPrompts([])
+    setIsAiQueuePaused(false)
     setAiError("")
     setAiNotice("")
+    setIsAiThinking(false)
     setIsAiStopping(false)
     setActiveAiChangeSetId("")
     setActiveAiChangeAction("")
@@ -723,7 +758,7 @@ export function WriterPage({
       isCurrent = false
       chapterRequestId.current += 1
     }
-  }, [loadChapter, project?.path, updateAiMessages])
+  }, [loadChapter, project?.path, updateAiMessages, updateAiQueuedPrompts])
 
   const saveCurrentChapter = useCallback(async () => {
     if (!project || !activeChapterName || !document || isSaving) return false
@@ -1144,23 +1179,15 @@ export function WriterPage({
     }
   }
 
-  async function sendAiMessage(explicitPrompt?: string) {
-    const prompt = (explicitPrompt ?? aiInput).trim()
-    if (
-      !project
-      || !prompt
-      || isAiThinking
-      || isAiHistoryLoading
-      || isAiCompacting
-      || hasPendingAiChanges
-    ) return
+  async function runAiMessage(prompt: string) {
+    if (!project || !prompt.trim()) return
     const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
     const userMessage: AiMessage = {
       id: `${requestId}-user`,
       role: "user",
-      content: prompt,
+      content: prompt.trim(),
     }
-    const nextMessages = [...aiMessages, userMessage]
+    const nextMessages = [...aiMessagesRef.current, userMessage]
     const assistantMessageId = `${requestId}-assistant`
     updateAiMessages([
       ...nextMessages,
@@ -1180,6 +1207,7 @@ export function WriterPage({
     setAiNotice("")
     setIsAiThinking(true)
     setIsAiStopping(false)
+    setIsAiQueuePaused(false)
     try {
       try {
         await window.authorDesk.ai.saveHistory(project.path, nextMessages)
@@ -1205,8 +1233,27 @@ export function WriterPage({
         },
         allowWriteTools: !isDirty,
       })
+      if (activeAiRequestIdRef.current !== requestId) return
+      const steeringMessages: AiMessage[] = (response.steeringMessages || []).map((message) => ({
+        id: `${requestId}-steer-${message.id}`,
+        role: "user",
+        content: message.content,
+        status: "运行中补充引导",
+      }))
+      const consumedSteeringIds = new Set(
+        (response.steeringMessages || []).map((message) => message.id),
+      )
+      const unconsumedSteeringIds = new Set(response.unconsumedSteeringIds || [])
+      updateAiQueuedPrompts((current) => current
+        .filter((promptItem) => !consumedSteeringIds.has(promptItem.id))
+        .map((promptItem) => (
+          unconsumedSteeringIds.has(promptItem.id)
+            ? { ...promptItem, status: "waiting" as const, requestId: undefined }
+            : promptItem
+        )))
       const completedMessages: AiMessage[] = [
         ...nextMessages,
+        ...steeringMessages,
         {
           id: assistantMessageId,
           role: "assistant",
@@ -1227,6 +1274,7 @@ export function WriterPage({
         activeAiRequestIdRef.current = ""
         activeAiMessageIdRef.current = ""
       }
+      setIsAiCompacting(true)
       setIsAiThinking(false)
       setIsAiStopping(false)
       try {
@@ -1236,7 +1284,6 @@ export function WriterPage({
           ? historyError.message
           : "AI 回复已完成，但对话历史保存失败")
       }
-      setIsAiCompacting(true)
       try {
         const compacted = await window.authorDesk.ai.compactHistory(project.path)
         setAiChatSummary(compacted.summary)
@@ -1259,6 +1306,12 @@ export function WriterPage({
         }
       }
     } catch (chatError) {
+      if (activeAiRequestIdRef.current !== requestId) return
+      updateAiQueuedPrompts((current) => current.map((promptItem) => (
+        promptItem.requestId === requestId
+          ? { ...promptItem, status: "waiting" as const, requestId: undefined }
+          : promptItem
+      )))
       if (isAiChatCanceledError(chatError)) {
         const stoppedMessages = aiMessagesRef.current.map((message) => (
           message.id === assistantMessageId
@@ -1273,6 +1326,7 @@ export function WriterPage({
         ))
         updateAiMessages(stoppedMessages)
         setAiError("")
+        setIsAiQueuePaused(true)
         window.authorDesk.ai.saveHistory(project.path, stoppedMessages).catch(() => {})
         return
       }
@@ -1288,17 +1342,112 @@ export function WriterPage({
         },
       ]
       setAiError(formattedError)
+      setIsAiQueuePaused(true)
       updateAiMessages(failedMessages)
       window.authorDesk.ai.saveHistory(project.path, failedMessages).catch(() => {})
     } finally {
       if (activeAiRequestIdRef.current === requestId) {
         activeAiRequestIdRef.current = ""
         activeAiMessageIdRef.current = ""
+        setIsAiThinking(false)
+        setIsAiStopping(false)
       }
-      setIsAiThinking(false)
-      setIsAiStopping(false)
     }
   }
+
+  async function queueAiGuidance(prompt: string) {
+    const requestId = activeAiRequestIdRef.current
+    const queuedPrompt: AiQueuedPrompt = {
+      id: `steer-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      content: prompt,
+      status: requestId && !isAiStopping ? "guiding" : "waiting",
+      requestId: requestId || undefined,
+    }
+    updateAiQueuedPrompts((current) => [...current, queuedPrompt])
+    if (!requestId || isAiStopping) return
+    try {
+      const result = await window.authorDesk.ai.steerChat({
+        requestId,
+        steerId: queuedPrompt.id,
+        content: queuedPrompt.content,
+      })
+      if (!result.ok) {
+        updateAiQueuedPrompts((current) => current.map((item) => (
+          item.id === queuedPrompt.id
+            ? { ...item, status: "waiting" as const, requestId: undefined }
+            : item
+        )))
+      }
+    } catch (steerError) {
+      updateAiQueuedPrompts((current) => current.map((item) => (
+        item.id === queuedPrompt.id
+          ? { ...item, status: "waiting" as const, requestId: undefined }
+          : item
+      )))
+      setAiError(steerError instanceof Error ? steerError.message : "补充引导发送失败")
+    }
+  }
+
+  async function removeQueuedPrompt(prompt: AiQueuedPrompt) {
+    if (prompt.status === "received") return
+    if (prompt.status === "guiding" && prompt.requestId) {
+      try {
+        const removed = await window.authorDesk.ai.removeSteer({
+          requestId: prompt.requestId,
+          steerId: prompt.id,
+        })
+        if (!removed) {
+          updateAiQueuedPrompts((current) => current.map((item) => (
+            item.id === prompt.id ? { ...item, status: "received" as const } : item
+          )))
+          return
+        }
+      } catch {
+        return
+      }
+    }
+    updateAiQueuedPrompts((current) => current.filter((item) => item.id !== prompt.id))
+  }
+
+  function sendAiMessage(explicitPrompt?: string) {
+    const prompt = (explicitPrompt ?? aiInput).trim()
+    if (!project || !prompt) return
+    setAiInput("")
+    setAiError("")
+    if (isAiThinking || isAiHistoryLoading || isAiCompacting || hasPendingAiChanges || !aiConfig.hasApiKey) {
+      queueAiGuidance(prompt)
+      if (!aiConfig.hasApiKey) setAiNotice("消息已保留；配置 API Key 后即可发送。")
+      else if (hasPendingAiChanges) setAiNotice("消息已进入待发送区；处理完待确认修改后会继续。")
+      return
+    }
+    runAiMessage(prompt)
+  }
+
+  useEffect(() => {
+    if (
+      isAiQueuePaused
+      || !project
+      || !aiConfig.hasApiKey
+      || isAiThinking
+      || isAiHistoryLoading
+      || isAiCompacting
+      || hasPendingAiChanges
+    ) return
+    const nextPrompt = aiQueuedPrompts.find((prompt) => prompt.status === "waiting")
+    if (!nextPrompt) return
+    updateAiQueuedPrompts((current) => current.filter((prompt) => prompt.id !== nextPrompt.id))
+    runAiMessage(nextPrompt.content)
+  }, [
+    aiConfig.hasApiKey,
+    aiQueuedPrompts,
+    hasPendingAiChanges,
+    isAiCompacting,
+    isAiHistoryLoading,
+    isAiQueuePaused,
+    isAiThinking,
+    project?.path,
+    updateAiQueuedPrompts,
+  ])
 
   if (!project) {
     return (
@@ -1952,78 +2101,121 @@ export function WriterPage({
                   {aiError}
                 </div>
               )}
+              {aiQueuedPrompts.length > 0 && (
+                <section className="mb-2 overflow-hidden rounded-xl border border-primary/15 bg-secondary/30" aria-label="AI 待发送消息">
+                  <header className="flex items-center gap-2 border-b border-primary/10 px-3 py-2">
+                    <Clock3 className="size-3.5 text-primary" />
+                    <span className="text-[11px] font-semibold">待发送与引导</span>
+                    <span className="rounded-full bg-white px-1.5 py-0.5 text-[9px] tabular-nums text-primary">
+                      {aiQueuedPrompts.length}
+                    </span>
+                    {isAiQueuePaused && (
+                      <button
+                        type="button"
+                        className="ml-auto rounded-full bg-white px-2 py-1 text-[9px] font-medium text-primary transition-colors hover:bg-primary hover:text-white"
+                        onClick={() => setIsAiQueuePaused(false)}
+                      >
+                        继续发送
+                      </button>
+                    )}
+                  </header>
+                  <div className="max-h-32 space-y-1.5 overflow-y-auto p-2">
+                    {aiQueuedPrompts.map((prompt) => (
+                      <div key={prompt.id} className="flex items-start gap-2 rounded-lg bg-white px-2.5 py-2 shadow-sm">
+                        <span className={`mt-1 size-1.5 shrink-0 rounded-full ${
+                          prompt.status === "received"
+                            ? "bg-emerald-500"
+                            : prompt.status === "guiding"
+                              ? "animate-pulse bg-primary"
+                              : "bg-amber-400"
+                        }`} />
+                        <div className="min-w-0 flex-1">
+                          <p className="select-text line-clamp-2 break-words text-[10px] leading-4 text-foreground/85">
+                            {prompt.content}
+                          </p>
+                          <p className="mt-0.5 text-[9px] text-muted-foreground">
+                            {prompt.status === "received"
+                              ? "已引导当前任务"
+                              : prompt.status === "guiding"
+                                ? "等待当前步骤结束后接收"
+                                : isAiQueuePaused
+                                  ? "队列已暂停"
+                                  : "等待发送"}
+                          </p>
+                        </div>
+                        {prompt.status !== "received" && (
+                          <button
+                            type="button"
+                            className="grid size-6 shrink-0 place-items-center rounded-full text-muted-foreground transition-colors hover:bg-red-50 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+                            aria-label="撤回待发送消息"
+                            title="撤回"
+                            onClick={() => removeQueuedPrompt(prompt)}
+                          >
+                            <X className="size-3" />
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
               <div className="rounded-xl border border-border bg-white p-2 shadow-[0_8px_22px_rgba(0,0,0,0.035)] focus-within:border-primary/30 focus-within:ring-3 focus-within:ring-primary/10">
                 <textarea
                   value={aiInput}
                   onChange={(event) => setAiInput(event.target.value)}
                   onKeyDown={(event) => {
-                    if (event.key !== "Enter" || event.shiftKey) return
+                    if (event.nativeEvent.isComposing || event.key !== "Enter" || event.shiftKey) return
                     event.preventDefault()
                     sendAiMessage()
                   }}
                   rows={3}
-                  disabled={
-                    !aiConfig.hasApiKey
-                    || isAiThinking
-                    || isAiHistoryLoading
-                    || isAiCompacting
-                    || hasPendingAiChanges
-                  }
+                  maxLength={20_000}
                   aria-label="AI 对话内容"
-                  placeholder={isAiHistoryLoading
-                    ? "正在恢复历史对话…"
-                    : isAiCompacting
-                      ? "正在压缩较早的对话记忆…"
-                    : isAiThinking
-                      ? "AI 正在回复…"
-                      : hasPendingAiChanges
-                        ? "请先保存或取消上方待确认修改…"
-                      : "向 AI 提问，或让它修改作品文件…"}
-                  className="w-full resize-none bg-transparent px-1.5 py-1 text-xs leading-5 outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed"
+                  placeholder={isAiThinking
+                    ? "继续输入要求，发送后会主动引导当前任务…"
+                    : "向 AI 提问，或让它修改作品文件…"}
+                  className="w-full resize-none bg-transparent px-1.5 py-1 text-xs leading-5 outline-none placeholder:text-muted-foreground"
                 />
                 <div className="mt-1 flex items-center justify-between gap-2">
                   <span className="pl-1 text-[10px] text-muted-foreground">
                     {isAiThinking
                       ? isAiStopping
                         ? "正在安全停止当前任务…"
-                        : "AI 正在运行，可随时手动停止"
+                        : "输入框保持可用 · 发送可引导当前任务"
                       : hasPendingAiChanges
-                        ? "请先保存或取消待确认修改"
+                        ? "新消息会进入待发送区，处理修改后继续"
+                      : isAiHistoryLoading || isAiCompacting
+                        ? "可以继续输入，新消息会先进入待发送区"
                       : isDirty
                         ? "请先保存正文，AI 才能修改文件"
                         : "Enter 发送 · Shift+Enter 换行"}
                   </span>
-                  {isAiThinking ? (
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    {isAiThinking && (
+                      <Button
+                        variant="outline"
+                        size="icon-sm"
+                        className="border-primary/20 bg-secondary text-primary hover:border-primary/35 hover:bg-primary/10"
+                        aria-label={isAiStopping ? "正在停止 AI" : "停止 AI"}
+                        title={isAiStopping ? "正在停止" : "停止生成"}
+                        disabled={isAiStopping}
+                        onClick={stopAiMessage}
+                      >
+                        {isAiStopping
+                          ? <LoaderCircle className="size-3.5 animate-spin" />
+                          : <Square className="size-3 fill-current" />}
+                      </Button>
+                    )}
                     <Button
-                      variant="outline"
                       size="icon-sm"
-                      className="border-primary/20 bg-secondary text-primary hover:border-primary/35 hover:bg-primary/10"
-                      aria-label={isAiStopping ? "正在停止 AI" : "停止 AI"}
-                      title={isAiStopping ? "正在停止" : "停止生成"}
-                      disabled={isAiStopping}
-                      onClick={stopAiMessage}
-                    >
-                      {isAiStopping
-                        ? <LoaderCircle className="size-3.5 animate-spin" />
-                        : <Square className="size-3 fill-current" />}
-                    </Button>
-                  ) : (
-                    <Button
-                      size="icon-sm"
-                      aria-label="发送消息"
-                      title="发送"
-                      disabled={
-                        !aiConfig.hasApiKey
-                        || !aiInput.trim()
-                        || isAiHistoryLoading
-                        || isAiCompacting
-                        || hasPendingAiChanges
-                      }
+                      aria-label={isAiThinking ? "加入当前任务引导" : "发送消息"}
+                      title={isAiThinking ? "加入当前任务引导" : "发送"}
+                      disabled={!aiInput.trim()}
                       onClick={() => sendAiMessage()}
                     >
                       <Send className="size-3.5" />
                     </Button>
-                  )}
+                  </div>
                 </div>
               </div>
             </div>

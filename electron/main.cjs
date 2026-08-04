@@ -1107,7 +1107,7 @@ const AI_CHAT_RECENT_MESSAGE_COUNT = 16
 const AI_CHAT_TOOL_ROUND_LIMIT = 12
 const AI_CHAT_SOFT_REVIEW_ROUND = 8
 const AI_CHAT_DUPLICATE_TOOL_LIMIT = 3
-const activeAiChatControllers = new Map()
+const activeAiChatSessions = new Map()
 const activeBookBreakdownControllers = new Map()
 const activeNovelIntroductionControllers = new Map()
 
@@ -1375,11 +1375,15 @@ async function requestAiCompletionWithRetry({
   body,
   onProgress,
   signal,
+  maxRetries = AI_MAX_RETRIES,
+  timeoutMs = 300_000,
 }) {
-  for (let attempt = 0; attempt <= AI_MAX_RETRIES; attempt += 1) {
+  const retryLimit = Math.min(AI_MAX_RETRIES, Math.max(0, Math.floor(maxRetries)))
+  const requestTimeoutMs = Math.max(30_000, Math.floor(timeoutMs))
+  for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
     throwIfAiRequestCanceled(signal)
     try {
-      const timeoutSignal = AbortSignal.timeout(300_000)
+      const timeoutSignal = AbortSignal.timeout(requestTimeoutMs)
       const requestSignal = signal && typeof AbortSignal.any === "function"
         ? AbortSignal.any([signal, timeoutSignal])
         : signal || timeoutSignal
@@ -1397,19 +1401,19 @@ async function requestAiCompletionWithRetry({
       if (signal?.aborted || error?.code === "AI_REQUEST_CANCELED") {
         throw createAiRequestCanceledError()
       }
-      if (!isRetryableAiError(error) || attempt >= AI_MAX_RETRIES) throw error
+      if (!isRetryableAiError(error) || attempt >= retryLimit) throw error
 
       const retryNumber = attempt + 1
-      const delayMs = AI_RETRY_DELAYS_MS[attempt]
+      const delayMs = AI_RETRY_DELAYS_MS[Math.min(attempt, AI_RETRY_DELAYS_MS.length - 1)]
       onProgress({ type: "content-reset" })
       onProgress({
         type: "status",
-        label: `${describeAiRetryReason(error)}，${Math.ceil(delayMs / 1000)} 秒后进行第 ${retryNumber}/${AI_MAX_RETRIES} 次重试…`,
+        label: `${describeAiRetryReason(error)}，${Math.ceil(delayMs / 1000)} 秒后进行第 ${retryNumber}/${retryLimit} 次重试…`,
       })
       await waitForAiRetry(delayMs, signal)
       onProgress({
         type: "status",
-        label: `正在进行第 ${retryNumber}/${AI_MAX_RETRIES} 次重试…`,
+        label: `正在进行第 ${retryNumber}/${retryLimit} 次重试…`,
       })
     }
   }
@@ -1489,7 +1493,7 @@ async function compactAiChatHistory(projectPath) {
   }
 }
 
-async function requestAiChat(input, onProgress = () => {}, signal) {
+async function requestAiChat(input, onProgress = () => {}, signal, steeringSession = null) {
   throwIfAiRequestCanceled(signal)
   if (!input || typeof input !== "object") throw new Error("AI 对话参数无效")
   const normalizedMessages = Array.isArray(input.messages)
@@ -1590,6 +1594,32 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
     }] : []),
     ...messages,
   ]
+  function consumeQueuedSteering() {
+    if (!steeringSession?.items.length) return 0
+    const queuedItems = steeringSession.items.splice(0)
+    for (const item of queuedItems) {
+      const consumedItem = {
+        id: item.id,
+        content: item.content,
+        consumedAt: new Date().toISOString(),
+      }
+      steeringSession.consumed.push(consumedItem)
+      apiMessages.push({
+        role: "user",
+        content: [
+          "【用户在任务执行期间追加的引导】",
+          item.content,
+          "请立即按这条最新要求调整后续思路和操作；若与此前要求冲突，以这条为准。",
+        ].join("\n"),
+      })
+      onProgress({
+        type: "steer-consumed",
+        steerId: item.id,
+        label: "补充引导已被当前任务接收",
+      })
+    }
+    return queuedItems.length
+  }
   const toolEvents = []
   const previewedPaths = new Set()
   const pendingChanges = new Map()
@@ -1633,6 +1663,7 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
       autoReviewed,
       changeSetId,
       pendingChangeCount: pendingChanges.size,
+      steeringMessages: [...(steeringSession?.consumed || [])],
       diagnostics: {
         elapsedMs: Date.now() - requestStartedAt,
         modelDurationMs,
@@ -1645,6 +1676,7 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
 
   async function finalizeWithAutomaticReview(reason) {
     throwIfAiRequestCanceled(signal)
+    consumeQueuedSteering()
     onProgress({
       type: "status",
       label: "工具调用已收束，正在自动审核并整理结果…",
@@ -1662,21 +1694,33 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
         "不要再请求调用工具，不要只回复错误提示。",
       ].join("\n"),
     })
-    const reviewedMessage = await requestTrackedCompletion({
-      endpoint,
-      config,
-      onProgress,
-      signal,
-      body: JSON.stringify({
-        model: config.model,
-        reasoning_effort: pendingChanges.size
-          ? getAiWrapUpReasoningEffort(config.reasoningEffort)
-          : config.reasoningEffort,
-        messages: apiMessages,
-        max_tokens: 4096,
-        stream: true,
-      }),
-    })
+    let reviewedMessage
+    for (let reviewPass = 0; reviewPass < 3; reviewPass += 1) {
+      reviewedMessage = await requestTrackedCompletion({
+        endpoint,
+        config,
+        onProgress,
+        signal,
+        body: JSON.stringify({
+          model: config.model,
+          reasoning_effort: pendingChanges.size
+            ? getAiWrapUpReasoningEffort(config.reasoningEffort)
+            : config.reasoningEffort,
+          messages: apiMessages,
+          max_tokens: 4096,
+          stream: true,
+        }),
+      })
+      if (!steeringSession?.items.length) break
+      if (reviewPass >= 2) break
+      const interimContent = typeof reviewedMessage?.content === "string"
+        ? reviewedMessage.content.trim()
+        : ""
+      if (interimContent) apiMessages.push({ role: "assistant", content: interimContent })
+      consumeQueuedSteering()
+      onProgress({ type: "content-reset" })
+      onProgress({ type: "status", label: "已收到新引导，正在重新整理最终答复…" })
+    }
     const reviewedContent = reviewedMessage?.content
     if (typeof reviewedContent !== "string" || !reviewedContent.trim()) {
       throw new Error("AI 自动审核没有返回有效内容")
@@ -1687,6 +1731,10 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
 
   for (let round = 0; round < AI_CHAT_TOOL_ROUND_LIMIT; round += 1) {
     throwIfAiRequestCanceled(signal)
+    if (consumeQueuedSteering()) {
+      onProgress({ type: "content-reset" })
+      onProgress({ type: "status", label: "已收到补充引导，正在调整当前任务…" })
+    }
     onProgress({
       type: "status",
       label: round === 0 ? "正在理解你的问题…" : "正在整理工具结果…",
@@ -1716,6 +1764,13 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
     if (!toolCalls.length) {
       const content = assistantMessage?.content
       if (typeof content !== "string" || !content.trim()) throw new Error("AI 没有返回有效内容")
+      if (steeringSession?.items.length) {
+        apiMessages.push({ role: "assistant", content: content.trim() })
+        consumeQueuedSteering()
+        onProgress({ type: "content-reset" })
+        onProgress({ type: "status", label: "已收到补充引导，正在继续处理…" })
+        continue
+      }
       onProgress({ type: "status", label: "回复完成" })
       return createAiChatResult(content.trim(), false)
     }
@@ -1726,6 +1781,7 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
       tool_calls: toolCalls,
     })
     let shouldForceReviewAfterRound = false
+    let shouldYieldToSteering = false
     for (const toolCall of toolCalls) {
       throwIfAiRequestCanceled(signal)
       const toolName = String(toolCall?.function?.name || "")
@@ -1739,14 +1795,17 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
       } catch {
         args = {}
       }
-      if (shouldForceReviewAfterRound) {
+      if (steeringSession?.items.length) shouldYieldToSteering = true
+      if (shouldForceReviewAfterRound || shouldYieldToSteering) {
         apiMessages.push({
           role: "tool",
           tool_call_id: toolCall.id,
           content: JSON.stringify({
             ok: false,
             skipped: true,
-            reason: "本轮已触发自动审核收束，剩余工具调用不再执行。",
+            reason: shouldYieldToSteering
+              ? "用户发来了新的引导，本轮剩余工具调用已暂停，请依据最新要求重新规划。"
+              : "本轮已触发自动审核收束，剩余工具调用不再执行。",
           }),
         })
         continue
@@ -1812,6 +1871,11 @@ async function requestAiChat(input, onProgress = () => {}, signal) {
           }),
         })
       }
+    }
+
+    if (consumeQueuedSteering()) {
+      onProgress({ type: "content-reset" })
+      onProgress({ type: "status", label: "补充引导已接收，正在按新要求继续…" })
     }
 
     if (shouldForceReviewAfterRound) {
@@ -3116,8 +3180,8 @@ async function chooseBookBreakdownSource(projectPath) {
 }
 
 function splitBookBreakdownText(content) {
-  const maximumChunks = 24
-  const targetSize = Math.max(60_000, Math.ceil(content.length / maximumChunks))
+  const maximumChunks = 40
+  const targetSize = Math.max(25_000, Math.ceil(content.length / maximumChunks))
   const chunks = []
   let start = 0
   while (start < content.length) {
@@ -3153,6 +3217,8 @@ async function analyzeBookBreakdownChunk(chunk, totalChunks, config, endpoint, o
     endpoint,
     config,
     signal,
+    maxRetries: 2,
+    timeoutMs: 120_000,
     onProgress: (progress) => {
       if (progress?.type === "status" && progress.label) {
         onProgress({
@@ -3163,7 +3229,7 @@ async function analyzeBookBreakdownChunk(chunk, totalChunks, config, endpoint, o
     },
     body: JSON.stringify({
       model: config.model,
-      reasoning_effort: "medium",
+      reasoning_effort: "low",
       messages: [
         {
           role: "system",
@@ -3200,7 +3266,7 @@ async function analyzeBookBreakdownChunk(chunk, totalChunks, config, endpoint, o
           ].join("\n\n"),
         },
       ],
-      max_tokens: 4_000,
+      max_tokens: 2_000,
       stream: true,
     }),
   })
@@ -3238,10 +3304,18 @@ async function requestBookBreakdown(projectPath, onProgress = () => {}, signal) 
   const config = getApiRuntimeConfig()
   const endpoint = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`
   const progressPath = bookBreakdownProgressPath(projectPath)
+  const chunkSignature = createHash("sha256")
+    .update(chunks.map((chunk) => `${chunk.start}:${chunk.end}`).join("|"))
+    .digest("hex")
   let partials = new Array(chunks.length)
   try {
     const cached = JSON.parse(await fs.promises.readFile(progressPath, "utf8"))
-    if (cached?.sourceHash === sourceHash && Array.isArray(cached.partials)) {
+    if (
+      cached?.version === 2
+      && cached?.sourceHash === sourceHash
+      && cached?.chunkSignature === chunkSignature
+      && Array.isArray(cached.partials)
+    ) {
       partials = chunks.map((_, index) => cached.partials[index] || null)
     }
   } catch (error) {
@@ -3257,37 +3331,89 @@ async function requestBookBreakdown(projectPath, onProgress = () => {}, signal) 
     })
   }
 
-  for (let batchStart = 0; batchStart < chunks.length; batchStart += 2) {
+  let progressWriteQueue = Promise.resolve()
+  const failedChunks = []
+  const persistProgress = () => {
+    const payload = `${JSON.stringify({
+      version: 2,
+      sourceHash,
+      chunkSignature,
+      updatedAt: new Date().toISOString(),
+      partials,
+    }, null, 2)}\n`
+    progressWriteQueue = progressWriteQueue.then(() => (
+      fs.promises.writeFile(progressPath, payload, "utf8")
+    ))
+    return progressWriteQueue
+  }
+
+  for (let batchStart = 0; batchStart < chunks.length; batchStart += 3) {
     throwIfAiRequestCanceled(signal)
     const batch = chunks
-      .slice(batchStart, batchStart + 2)
+      .slice(batchStart, batchStart + 3)
       .filter((chunk) => !partials[chunk.index])
     if (!batch.length) continue
     onProgress({
       phase: "analyzing",
-      label: `AI 正在拆解第 ${batch[0].index + 1}-${batch.at(-1).index + 1} 段…`,
+      label: `AI 正在并行拆解第 ${batch[0].index + 1}-${batch.at(-1).index + 1} 段…`,
       completed,
       total: chunks.length,
     })
-    const results = await Promise.all(batch.map((chunk) => (
-      analyzeBookBreakdownChunk(chunk, chunks.length, config, endpoint, onProgress, signal)
-    )))
-    results.forEach((result, index) => {
-      partials[batch[index].index] = result
-    })
-    completed = partials.filter(Boolean).length
-    await fs.promises.writeFile(progressPath, `${JSON.stringify({
-      version: 1,
-      sourceHash,
-      updatedAt: new Date().toISOString(),
-      partials,
-    }, null, 2)}\n`, "utf8")
-    onProgress({
-      phase: "analyzing",
-      label: `已完成 ${completed}/${chunks.length} 段`,
-      completed,
-      total: chunks.length,
-    })
+    const completedBeforeBatch = completed
+    const failuresBeforeBatch = failedChunks.length
+    await Promise.all(batch.map(async (chunk) => {
+      const startedAt = Date.now()
+      try {
+        const result = await analyzeBookBreakdownChunk(
+          chunk,
+          chunks.length,
+          config,
+          endpoint,
+          onProgress,
+          signal,
+        )
+        partials[chunk.index] = result
+        completed = partials.filter(Boolean).length
+        await persistProgress()
+        const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1_000))
+        const elapsedLabel = elapsedSeconds >= 60
+          ? `${Math.floor(elapsedSeconds / 60)} 分 ${elapsedSeconds % 60} 秒`
+          : `${elapsedSeconds} 秒`
+        onProgress({
+          phase: "analyzing",
+          label: `第 ${chunk.index + 1}/${chunks.length} 段已完成，用时 ${elapsedLabel}`,
+          completed,
+          total: chunks.length,
+        })
+      } catch (error) {
+        if (signal?.aborted || error?.code === "AI_REQUEST_CANCELED") throw error
+        failedChunks.push({
+          index: chunk.index,
+          message: error instanceof Error ? error.message : String(error),
+        })
+        onProgress({
+          phase: "analyzing",
+          label: `第 ${chunk.index + 1}/${chunks.length} 段失败，已跳过并继续其他片段`,
+          completed,
+          total: chunks.length,
+        })
+      }
+    }))
+    const batchFailureCount = failedChunks.length - failuresBeforeBatch
+    if (completed === completedBeforeBatch && batchFailureCount === batch.length) {
+      break
+    }
+  }
+
+  await progressWriteQueue
+  if (failedChunks.length) {
+    const failedLabels = failedChunks.map(({ index }) => index + 1).join("、")
+    const firstFailure = failedChunks[0]?.message
+      ? ` 首个错误：${String(failedChunks[0].message).slice(0, 300)}`
+      : ""
+    throw new Error(
+      `第 ${failedLabels} 段分析失败，其他 ${completed} 段进度已保存。请再次开始拆书，程序将只补拆尚未完成的片段。${firstFailure}`,
+    )
   }
 
   throwIfAiRequestCanceled(signal)
@@ -3301,6 +3427,8 @@ async function requestBookBreakdown(projectPath, onProgress = () => {}, signal) 
     endpoint,
     config,
     signal,
+    maxRetries: 2,
+    timeoutMs: 180_000,
     onProgress: (progress) => {
       if (progress?.type === "status" && progress.label) {
         onProgress({ phase: "retrying", label: progress.label })
@@ -3308,7 +3436,7 @@ async function requestBookBreakdown(projectPath, onProgress = () => {}, signal) 
     },
     body: JSON.stringify({
       model: config.model,
-      reasoning_effort: config.reasoningEffort,
+      reasoning_effort: "medium",
       messages: [
         {
           role: "system",
@@ -3377,7 +3505,7 @@ async function requestBookBreakdown(projectPath, onProgress = () => {}, signal) 
           ].join("\n\n"),
         },
       ],
-      max_tokens: 10_000,
+      max_tokens: 8_000,
       stream: true,
     }),
   })
@@ -5102,29 +5230,67 @@ ipcMain.handle("ai:chat", async (event, input) => {
   if (!requestId) throw new Error("AI 请求 ID 无效")
   const requestKey = `${event.sender.id}:${requestId}`
   const controller = new AbortController()
-  activeAiChatControllers.set(requestKey, controller)
+  const session = {
+    controller,
+    items: [],
+    consumed: [],
+  }
+  activeAiChatSessions.set(requestKey, session)
   try {
-    return await requestAiChat(input, (progress) => {
+    const result = await requestAiChat(input, (progress) => {
       if (event.sender.isDestroyed()) return
       event.sender.send("ai:chat-progress", {
         requestId,
         ...progress,
       })
-    }, controller.signal)
+    }, controller.signal, session)
+    return {
+      ...result,
+      unconsumedSteeringIds: session.items.map((item) => item.id),
+    }
   } finally {
-    if (activeAiChatControllers.get(requestKey) === controller) {
-      activeAiChatControllers.delete(requestKey)
+    if (activeAiChatSessions.get(requestKey) === session) {
+      activeAiChatSessions.delete(requestKey)
     }
   }
+})
+
+ipcMain.handle("ai:steer-chat", (event, input) => {
+  const requestId = String(input?.requestId || "")
+  const steerId = String(input?.steerId || "").trim().slice(0, 300)
+  const content = String(input?.content || "").trim().slice(0, 20_000)
+  if (!requestId || !steerId || !content) throw new Error("补充引导内容无效")
+  const session = activeAiChatSessions.get(`${event.sender.id}:${requestId}`)
+  if (!session || session.controller.signal.aborted) {
+    return { ok: false, status: "request-ended" }
+  }
+  if (session.items.length >= 100) throw new Error("当前任务的待发送引导过多，请稍后再试")
+  if (
+    session.items.some((item) => item.id === steerId)
+    || session.consumed.some((item) => item.id === steerId)
+  ) return { ok: true, status: "accepted" }
+  session.items.push({ id: steerId, content })
+  return { ok: true, status: "accepted" }
+})
+
+ipcMain.handle("ai:remove-steer", (event, input) => {
+  const requestId = String(input?.requestId || "")
+  const steerId = String(input?.steerId || "").trim()
+  const session = activeAiChatSessions.get(`${event.sender.id}:${requestId}`)
+  if (!session) return false
+  const itemIndex = session.items.findIndex((item) => item.id === steerId)
+  if (itemIndex < 0) return false
+  session.items.splice(itemIndex, 1)
+  return true
 })
 
 ipcMain.handle("ai:cancel-chat", (event, requestIdInput) => {
   const requestId = String(requestIdInput || "")
   if (!requestId) return false
   const requestKey = `${event.sender.id}:${requestId}`
-  const controller = activeAiChatControllers.get(requestKey)
-  if (!controller) return false
-  controller.abort(createAiRequestCanceledError())
+  const session = activeAiChatSessions.get(requestKey)
+  if (!session) return false
+  session.controller.abort(createAiRequestCanceledError())
   return true
 })
 

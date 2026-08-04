@@ -329,7 +329,7 @@ export function BookBreakdownDialog({
                     <Route className="mx-auto size-9 text-primary" />
                     <h3 className="mt-4 text-base font-semibold">TXT 已准备好</h3>
                     <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                      拆解过程会覆盖全文，并按批次保存进度。内容较长时可以关闭弹窗，或停止后稍后继续。
+                      拆解过程会覆盖全文，每完成一个片段都会立即保存。未完成片段可稍后单独补拆，也可以随时停止后继续。
                     </p>
                     {!isAnalyzing && (
                       <Button className="mt-5" onClick={analyze}>

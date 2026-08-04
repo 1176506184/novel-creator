@@ -155,10 +155,11 @@ type AiChatCompactResult = AiChatHistory & {
 
 type AiChatProgress = {
   requestId: string
-  type: "content-delta" | "content-reset" | "status" | "tool-event"
+  type: "content-delta" | "content-reset" | "status" | "tool-event" | "steer-consumed"
   delta?: string
   label?: string
   toolEvent?: AiToolEvent
+  steerId?: string
 }
 
 type CharacterProfile = {
@@ -471,8 +472,26 @@ declare global {
           autoReviewed: boolean
           changeSetId: string
           pendingChangeCount: number
+          steeringMessages: Array<{
+            id: string
+            content: string
+            consumedAt: string
+          }>
+          unconsumedSteeringIds: string[]
           diagnostics: AiDiagnostics
         }>
+        steerChat(input: {
+          requestId: string
+          steerId: string
+          content: string
+        }): Promise<{
+          ok: boolean
+          status: "accepted" | "request-ended"
+        }>
+        removeSteer(input: {
+          requestId: string
+          steerId: string
+        }): Promise<boolean>
         cancelChat(requestId: string): Promise<boolean>
         applyChanges(projectPath: string, changeSetId: string): Promise<{
           ok: boolean

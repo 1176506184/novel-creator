@@ -418,6 +418,74 @@ svg {
   transform: translateX(-10px);
 }
 
+.real-app-preview {
+  position: relative;
+  z-index: 3;
+  margin: 0;
+  overflow: hidden;
+  background: white;
+  border: 1px solid rgba(226, 216, 210, 0.95);
+  border-radius: 20px;
+  box-shadow:
+    0 45px 100px rgba(85, 45, 24, 0.16),
+    0 8px 30px rgba(85, 45, 24, 0.08);
+}
+
+.real-app-preview a,
+.real-app-preview img {
+  display: block;
+}
+
+.real-app-preview img {
+  width: 100%;
+  height: auto;
+}
+
+.real-app-preview figcaption {
+  position: absolute;
+  bottom: 14px;
+  left: 14px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 11px;
+  color: var(--ink-800);
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(232, 224, 218, 0.95);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(58, 37, 25, 0.1);
+  backdrop-filter: blur(12px);
+}
+
+.real-app-preview figcaption span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--orange-600);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.real-app-preview figcaption i {
+  width: 7px;
+  height: 7px;
+  background: var(--orange-500);
+  border-radius: 50%;
+  box-shadow: 0 0 0 4px var(--orange-100);
+}
+
+.real-app-preview figcaption strong {
+  color: var(--ink-500);
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.app-preview-wrap > .preview-orbit,
+.app-preview-wrap > .app-preview,
+.app-preview-wrap > .floating-card {
+  display: none;
+}
+
 .app-preview {
   position: relative;
   z-index: 2;
@@ -2153,6 +2221,21 @@ svg {
 
   .app-preview-wrap {
     width: 100%;
+  }
+
+  .real-app-preview {
+    border-radius: 14px;
+  }
+
+  .real-app-preview figcaption {
+    right: 10px;
+    bottom: 10px;
+    left: 10px;
+    justify-content: center;
+  }
+
+  .real-app-preview figcaption strong {
+    display: none;
   }
 
   .preview-body {

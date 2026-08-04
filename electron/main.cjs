@@ -19,7 +19,7 @@ const {
 
 const APP_NAME = "作者管家"
 const APP_ID = "com.novelcreator.author-desk"
-const SERVICE_PORT = 37891
+const SERVICE_PORT = Number(process.env.AUTHOR_DESK_SERVICE_PORT) || 37891
 const SERVICE_URL = `http://127.0.0.1:${SERVICE_PORT}`
 const PRELOAD_PATH = path.join(__dirname, "preload.cjs")
 const SERVER_PATH = path.join(__dirname, "server.cjs")
@@ -71,6 +71,10 @@ let saveBoundsTimer = null
 const childWindows = new Set()
 
 app.setName(APP_NAME)
+const isolatedUserDataDirectory = String(process.env.AUTHOR_DESK_USER_DATA_DIR || "").trim()
+if (isolatedUserDataDirectory && path.isAbsolute(isolatedUserDataDirectory)) {
+  app.setPath("userData", path.resolve(isolatedUserDataDirectory))
+}
 if (process.platform === "win32") app.setAppUserModelId(APP_ID)
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
@@ -4128,6 +4132,10 @@ function secureExternalNavigation(window) {
     window.webContents.toggleDevTools()
   })
   window.webContents.on("did-finish-load", () => {
+    const isolatedZoomFactor = Number(process.env.AUTHOR_DESK_ZOOM_FACTOR)
+    if (Number.isFinite(isolatedZoomFactor) && isolatedZoomFactor >= 0.5 && isolatedZoomFactor <= 1.5) {
+      window.webContents.setZoomFactor(isolatedZoomFactor)
+    }
     if (SHOULD_OPEN_DEVTOOLS && !window.webContents.isDevToolsOpened()) {
       window.webContents.openDevTools({ mode: "detach", activate: true })
     }

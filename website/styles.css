@@ -425,10 +425,10 @@ svg {
   overflow: hidden;
   background: white;
   border: 1px solid rgba(226, 216, 210, 0.95);
-  border-radius: 20px;
+  border-radius: 12px;
   box-shadow:
-    0 45px 100px rgba(85, 45, 24, 0.16),
-    0 8px 30px rgba(85, 45, 24, 0.08);
+    0 28px 70px rgba(85, 45, 24, 0.13),
+    0 6px 20px rgba(85, 45, 24, 0.06);
 }
 
 .real-app-preview a,
@@ -2224,7 +2224,7 @@ svg {
   }
 
   .real-app-preview {
-    border-radius: 14px;
+    border-radius: 8px;
   }
 
   .real-app-preview figcaption {

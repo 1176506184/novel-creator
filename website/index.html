@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="作者管家是一款本地优先的 Windows 小说写作工作台，集作品目录、章节编辑、AI 写作助手、角色关系、写作规则与 Git 同步于一体。"
+      content="作者管家是一款本地优先的 Windows 小说写作工作台，集章节编辑、可控 AI 助手、长篇拆书、角色关系、写作规则、差异确认与 Git 同步于一体。"
     />
     <meta name="theme-color" content="#ff5a2a" />
     <meta property="og:type" content="website" />
@@ -55,6 +55,7 @@
 
         <nav class="site-nav" id="site-nav" aria-label="主导航" data-nav>
           <a href="#features">产品能力</a>
+          <a href="#versions">版本历程</a>
           <a href="#workflow">写作流程</a>
           <a href="#privacy">本地优先</a>
           <a href="#faq">常见问题</a>
@@ -78,6 +79,7 @@
             <div class="eyebrow">
               <span class="status-dot" aria-hidden="true"></span>
               为长篇创作而生的桌面工作台
+              <span class="version-chip" data-version-label>v0.1.5</span>
             </div>
             <h1>
               把小说、章节与 AI，
@@ -204,6 +206,10 @@
                     <span></span>
                     <p>开头氛围稳定。建议在信件内容揭晓前，再增加一个与旧案有关的细节伏笔。</p>
                   </div>
+                  <div class="ai-queue">
+                    <i aria-hidden="true"></i>
+                    <span><strong>待发送引导</strong><small>补充：保留现在的叙事视角</small></span>
+                  </div>
                   <div class="ai-input">继续追问，或让 AI 修改文件…</div>
                 </aside>
               </div>
@@ -235,6 +241,165 @@
         </div>
       </section>
 
+      <section class="section latest-section" id="latest">
+        <div class="shell">
+          <div class="release-panel reveal">
+            <div class="release-heading">
+              <div>
+                <div class="eyebrow">当前版本 <span data-version-label>v0.1.5</span></div>
+                <h2>长篇处理更快，AI 协作也更可控</h2>
+                <p>
+                  这一版集中解决真实写作中的等待、失控和数据安全问题：任务运行时仍能补充要求，
+                  修改先看差异，长篇拆解按片段保存，失败后从断点继续。
+                </p>
+              </div>
+              <a
+                class="release-link"
+                href="https://github.com/1176506184/novel-creator/releases/tag/v0.1.5"
+                target="_blank"
+                rel="noreferrer"
+                data-release-link
+              >
+                查看更新说明
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" /></svg>
+              </a>
+            </div>
+
+            <div class="update-grid">
+              <article class="update-item">
+                <span class="update-icon">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v11H8l-3 3V5Zm4 4h6m-6 3h4" /></svg>
+                </span>
+                <div><h3>运行中继续引导</h3><p>AI 工作时输入框始终可用，补充要求进入待发送区，可撤回、可主动调整当前任务。</p></div>
+              </article>
+              <article class="update-item">
+                <span class="update-icon">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4zM8 9h8m-8 4h5m4 3 2 2 3-4" /></svg>
+                </span>
+                <div><h3>长篇 TXT 拆书</h3><p>提炼故事阶段、情节点、人物弧线与伏笔回收；三路并行分析，每段完成立即保存。</p></div>
+              </article>
+              <article class="update-item">
+                <span class="update-icon">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4H4v16h4M16 4h4v16h-4M9 8h6m-6 4h6m-6 4h4" /></svg>
+                </span>
+                <div><h3>修改前先看 Diff</h3><p>删除内容以红色标记，新增内容以绿色标记；确认后保存，不满意可以整组取消。</p></div>
+              </article>
+              <article class="update-item">
+                <span class="update-icon">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2" /><circle cx="18" cy="6" r="2" /><circle cx="12" cy="18" r="2" /><path d="M8 6h8m1 2-4 8M7 8l4 8" /></svg>
+                </span>
+                <div><h3>内置 Git 管理</h3><p>应用内配置仓库、身份和令牌，一键先拉取再推送；遇到冲突停下并交给你确认。</p></div>
+              </article>
+              <article class="update-item">
+                <span class="update-icon">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5zM8 8h8m-8 4h8m-8 4h5M16 15l1 1 2-3" /></svg>
+                </span>
+                <div><h3>作品简介与文风研究</h3><p>自动拾取“简介.md”，支持自定义提示词生成简介，并从参考小说总结文风或对比两篇文章。</p></div>
+              </article>
+              <article class="update-item">
+                <span class="update-icon">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4a3 3 0 0 0-3 3v2a3 3 0 0 0 0 6v2a3 3 0 0 0 3 3m8-16a3 3 0 0 1 3 3v2a3 3 0 0 1 0 6v2a3 3 0 0 1-3 3M9 8h6m-6 4h6m-6 4h4" /></svg>
+                </span>
+                <div><h3>记忆、规则与对话持久化</h3><p>可视化 AI 对小说的记忆，自动扫描 rules-*.md；对话保存在作品 .chat 中并自动压缩。</p></div>
+              </article>
+            </div>
+          </div>
+
+          <div class="version-history" id="versions">
+            <div class="version-history-heading reveal">
+              <div>
+                <div class="eyebrow">持续更新，不隐藏变化</div>
+                <h2>从第一个版本，到现在</h2>
+              </div>
+              <p>每一版只记录真正落地的功能与修复。你可以直接进入对应 Release 查看完整说明和安装包。</p>
+            </div>
+
+            <ol class="version-list">
+              <li class="version-card version-card-current reveal">
+                <div class="version-card-head">
+                  <a href="https://github.com/1176506184/novel-creator/releases/tag/v0.1.5" target="_blank" rel="noreferrer">
+                    v0.1.5
+                  </a>
+                  <span>当前版本 · 2026.08.04</span>
+                </div>
+                <h3>可控 AI 与更快拆书</h3>
+                <ul>
+                  <li>运行中消息进入可撤回的引导队列</li>
+                  <li>模型和工具步骤间主动接收新要求</li>
+                  <li>长篇 TXT 三路并发、逐段保存和失败续拆</li>
+                  <li>Git 仓库、身份和访问令牌改为应用内配置</li>
+                </ul>
+              </li>
+              <li class="version-card reveal">
+                <div class="version-card-head">
+                  <a href="https://github.com/1176506184/novel-creator/releases/tag/v0.1.4" target="_blank" rel="noreferrer">v0.1.4</a>
+                  <span>2026.08.03</span>
+                </div>
+                <h3>作品简介与启动恢复</h3>
+                <ul>
+                  <li>自动识别、查看和编辑“简介.md”</li>
+                  <li>支持自定义提示词生成卖点与无剧透简介</li>
+                  <li>记住已选小说，启动直接进入写作台</li>
+                  <li>拆书报告补充目标、冲突升级和伏笔回收</li>
+                </ul>
+              </li>
+              <li class="version-card reveal">
+                <div class="version-card-head">
+                  <a href="https://github.com/1176506184/novel-creator/releases/tag/v0.1.3" target="_blank" rel="noreferrer">v0.1.3</a>
+                  <span>2026.07.30</span>
+                </div>
+                <h3>更快的 AI 文件修改</h3>
+                <ul>
+                  <li>合并 Diff 与暂存修改流程，减少重复读取</li>
+                  <li>支持单轮并行调用多个工具并更快收束</li>
+                  <li>展示耗时、模型轮次和工具调用次数</li>
+                  <li>自动发现小说目录内所有 rules-*.md</li>
+                </ul>
+              </li>
+              <li class="version-card reveal">
+                <div class="version-card-head">
+                  <a href="https://github.com/1176506184/novel-creator/releases/tag/v0.1.2" target="_blank" rel="noreferrer">v0.1.2</a>
+                  <span>2026.07.29</span>
+                </div>
+                <h3>异常恢复与规则定制</h3>
+                <ul>
+                  <li>待确认修改丢失后自动解除阻塞</li>
+                  <li>保存与取消支持幂等恢复，多文件中断可继续</li>
+                  <li>支持 AI 首次写入 0 字节空章节</li>
+                  <li>写作规则可新增、编辑、启停和删除</li>
+                </ul>
+              </li>
+              <li class="version-card reveal">
+                <div class="version-card-head">
+                  <a href="https://github.com/1176506184/novel-creator/releases/tag/v0.1.1" target="_blank" rel="noreferrer">v0.1.1</a>
+                  <span>2026.07.29</span>
+                </div>
+                <h3>任务常驻与安全修改</h3>
+                <ul>
+                  <li>切换页面后 AI 继续运行并支持手动停止</li>
+                  <li>工具轮数到达上限后自动审核收束</li>
+                  <li>红绿差异视图支持展开查看</li>
+                  <li>修改先暂存，可保存或整组取消</li>
+                </ul>
+              </li>
+              <li class="version-card reveal">
+                <div class="version-card-head">
+                  <a href="https://github.com/1176506184/novel-creator/releases/tag/v0.1.0" target="_blank" rel="noreferrer">v0.1.0</a>
+                  <span>首个公开版 · 2026.07.29</span>
+                </div>
+                <h3>本地优先的创作基础</h3>
+                <ul>
+                  <li>目录式小说库、章节编辑与 AI 写作台</li>
+                  <li>角色关系、故事记忆和写作规则可视化</li>
+                  <li>参考文风总结、双文章对比与文件工具</li>
+                  <li>对话持久化、自动压缩、自定义 API 与 Git 同步</li>
+                </ul>
+              </li>
+            </ol>
+          </div>
+        </div>
+      </section>
+
       <section class="section" id="features">
         <div class="shell">
           <div class="section-heading reveal">
@@ -256,6 +421,7 @@
                   <li>自动识别与创建正文目录</li>
                   <li>按章节统计真实正文字数</li>
                   <li>新建、重命名和删除作品章节</li>
+                  <li>读取“简介.md”并按提示词生成简介</li>
                 </ul>
               </div>
               <div class="folder-visual" aria-hidden="true">
@@ -287,9 +453,9 @@
                 </svg>
               </span>
               <h3>能动手的 AI 助手</h3>
-              <p>不只回答问题。AI 可以读取、创建和修改作品文件，并在执行前展示清晰 diff。</p>
+              <p>不只回答问题。AI 可以读取、创建和修改作品文件；运行时可继续引导，也能随时停止。</p>
               <div class="tool-stack" aria-label="AI 文件工具">
-                <span>读取章节</span><span>修改文件</span><span>生成差异</span>
+                <span>读取章节</span><span>待发送引导</span><span>差异确认</span>
               </div>
             </article>
 
@@ -429,7 +595,15 @@
             </details>
             <details>
               <summary>如何备份和同步小说？<span></span></summary>
-              <p>你可以把作品目录纳入 Git 仓库，并通过应用内同步按钮执行拉取与推送。遇到冲突时会停止同步并提示手动合并。</p>
+              <p>在设置中配置仓库地址、克隆账号、访问令牌和作者身份即可，无需在系统外单独配置 Git。同步会先拉取再推送，遇到冲突时停止并提示手动合并。</p>
+            </details>
+            <details>
+              <summary>40 万字的 TXT 可以拆解吗？<span></span></summary>
+              <p>可以。拆书会把长篇正文分成较小片段并行分析，每完成一个片段立即保存。网络失败或主动停止后，再次开始只补拆尚未完成的片段。</p>
+            </details>
+            <details>
+              <summary>电脑没有安装 Node.js 能运行吗？<span></span></summary>
+              <p>可以。Windows 安装包已经包含 Electron 和应用所需的 Node.js 运行环境，普通用户无需额外安装 Node.js。</p>
             </details>
           </div>
         </div>
@@ -442,7 +616,7 @@
             <div>
               <div class="eyebrow">下一章，从这里开始</div>
               <h2>让工具记住设定，把注意力还给故事</h2>
-              <p>Windows x64 · 本地优先 · 开源项目</p>
+              <p data-download-meta>Windows x64 · v0.1.5 · 内置运行环境 · 无需安装 Node.js</p>
             </div>
             <a
               class="button button-light button-large"

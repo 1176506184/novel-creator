@@ -75,9 +75,23 @@ const updateReleaseLinks = async () => {
       link.href = href;
     });
 
+    document.querySelectorAll("[data-release-link]").forEach((link) => {
+      link.href = release.html_url || releaseUrl;
+    });
+
     if (version) {
       document.querySelectorAll("[data-download-label]").forEach((label) => {
         label.textContent = `下载 Windows 版 v${version}`;
+      });
+      document.querySelectorAll("[data-version-label]").forEach((label) => {
+        label.textContent = `v${version}`;
+      });
+    }
+
+    if (windowsAsset?.size) {
+      const sizeInMb = Math.max(1, Math.round(windowsAsset.size / 1024 / 1024));
+      document.querySelectorAll("[data-download-meta]").forEach((label) => {
+        label.textContent = `Windows x64 · v${version || "最新版"} · ${sizeInMb} MB · 无需安装 Node.js`;
       });
     }
   } catch {

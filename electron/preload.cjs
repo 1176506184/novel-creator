@@ -58,10 +58,22 @@ contextBridge.exposeInMainWorld("authorDesk", {
     deleteChapter: (projectPath, chapterName) => (
       ipcRenderer.invoke("project:delete-chapter", projectPath, chapterName)
     ),
+    listChapterHistory: (projectPath, chapterName) => (
+      ipcRenderer.invoke("project:list-chapter-history", projectPath, chapterName)
+    ),
+    getChapterHistory: (projectPath, chapterName, historyId) => (
+      ipcRenderer.invoke("project:get-chapter-history", projectPath, chapterName, historyId)
+    ),
+    restoreChapterHistory: (projectPath, chapterName, historyId) => (
+      ipcRenderer.invoke("project:restore-chapter-history", projectPath, chapterName, historyId)
+    ),
   },
   settings: {
     getApi: () => ipcRenderer.invoke("settings:get-api"),
     saveApi: (input) => ipcRenderer.invoke("settings:save-api", input),
+    getAiPreferences: () => ipcRenderer.invoke("settings:get-ai-preferences"),
+    saveAiPreferences: (input) => ipcRenderer.invoke("settings:save-ai-preferences", input),
+    forceReleaseWorkspace: () => ipcRenderer.invoke("settings:force-release-workspace"),
   },
   ai: {
     chat: (input) => ipcRenderer.invoke("ai:chat", input),
@@ -127,6 +139,7 @@ contextBridge.exposeInMainWorld("authorDesk", {
       ipcRenderer.invoke("book-breakdown:choose-source", projectPath)
     ),
     analyze: (input) => ipcRenderer.invoke("book-breakdown:analyze", input),
+    summarizeStyle: (input) => ipcRenderer.invoke("book-breakdown:summarize-style", input),
     cancel: (requestId) => ipcRenderer.invoke("book-breakdown:cancel", requestId),
     openDirectory: (projectPath) => (
       ipcRenderer.invoke("book-breakdown:open-directory", projectPath)

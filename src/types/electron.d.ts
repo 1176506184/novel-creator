@@ -87,6 +87,33 @@ type ChapterDocument = ChapterSummary & {
   content: string
 }
 
+type ChapterHistoryEntry = {
+  id: string
+  createdAt: string
+  characterCount: number
+  byteSize: number
+}
+
+type ChapterHistoryState = {
+  ok: boolean
+  chapterName: string
+  limit: number
+  entries: ChapterHistoryEntry[]
+}
+
+type ChapterHistoryDetail = ChapterHistoryEntry & {
+  ok: boolean
+  diff: string
+  sameAsCurrent: boolean
+}
+
+type RestoreChapterHistoryResult = {
+  ok: boolean
+  restoredFrom: string
+  document: ChapterDocument
+  history: ChapterHistoryState
+}
+
 type ApiSettings = {
   baseUrl: string
   model: string
@@ -97,6 +124,10 @@ type ApiSettings = {
 type ApiSettingsInput = Omit<ApiSettings, "hasApiKey"> & {
   apiKey?: string
   clearApiKey?: boolean
+}
+
+type AiPreferences = {
+  autoConfirmChanges: boolean
 }
 
 type AiChatMessage = {
@@ -315,16 +346,25 @@ type BookBreakdownState = {
   sourceName: string
   sourceBytes: number
   characterCount: number
+  detectionMethod: "headings" | "fallback"
+  detectedChapterCount: number
+  selectedChapterCount: number
+  selectedCharacterCount: number
+  chapterTitles: string[]
   importedAt: string | null
   generatedAt: string | null
+  styleGeneratedAt: string | null
+  styleSampledCharacters: number
+  styleError: string
   model: string
   analyzedChunks: number
   report: BookBreakdownReport | null
+  styleProfile: ReferenceStyleProfile | null
 }
 
 type BookBreakdownProgress = {
   requestId: string
-  phase: "reading" | "splitting" | "analyzing" | "synthesizing" | "saving" | "retrying" | "complete"
+  phase: "reading" | "splitting" | "analyzing" | "synthesizing" | "style" | "saving" | "retrying" | "complete"
   label: string
   completed?: number
   total?: number
@@ -459,10 +499,30 @@ declare global {
           ok: boolean
           name: string
         }>
+        listChapterHistory(
+          projectPath: string,
+          chapterName: string,
+        ): Promise<ChapterHistoryState>
+        getChapterHistory(
+          projectPath: string,
+          chapterName: string,
+          historyId: string,
+        ): Promise<ChapterHistoryDetail>
+        restoreChapterHistory(
+          projectPath: string,
+          chapterName: string,
+          historyId: string,
+        ): Promise<RestoreChapterHistoryResult>
       }
       settings: {
         getApi(): Promise<ApiSettings>
         saveApi(input: ApiSettingsInput): Promise<ApiSettings>
+        getAiPreferences(): Promise<AiPreferences>
+        saveAiPreferences(input: AiPreferences): Promise<AiPreferences>
+        forceReleaseWorkspace(): Promise<{
+          ok: boolean
+          abortedAiRequests: number
+        }>
       }
       ai: {
         chat(input: AiChatInput): Promise<{
@@ -567,6 +627,12 @@ declare global {
         analyze(input: {
           requestId: string
           projectPath: string
+          chapterLimit?: number
+        }): Promise<BookBreakdownState>
+        summarizeStyle(input: {
+          requestId: string
+          projectPath: string
+          chapterLimit?: number
         }): Promise<BookBreakdownState>
         cancel(requestId: string): Promise<boolean>
         openDirectory(projectPath: string): Promise<boolean>

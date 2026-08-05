@@ -6,6 +6,7 @@ import {
   CloudCog,
   Eye,
   EyeOff,
+  FileCheck2,
   FolderOpen,
   GitBranch,
   KeyRound,
@@ -13,7 +14,9 @@ import {
   LoaderCircle,
   MonitorDown,
   Power,
+  RotateCcw,
   Save,
+  ShieldAlert,
   ShieldCheck,
   Trash2,
 } from "lucide-react"
@@ -67,6 +70,11 @@ export function SettingsPage({
   const [isSavingCloseBehavior, setIsSavingCloseBehavior] = useState(false)
   const [closeBehaviorMessage, setCloseBehaviorMessage] = useState("")
   const [closeBehaviorError, setCloseBehaviorError] = useState("")
+  const [autoConfirmAiChanges, setAutoConfirmAiChanges] = useState(false)
+  const [isLoadingAiPreferences, setIsLoadingAiPreferences] = useState(true)
+  const [isSavingAiPreferences, setIsSavingAiPreferences] = useState(false)
+  const [aiPreferencesMessage, setAiPreferencesMessage] = useState("")
+  const [aiPreferencesError, setAiPreferencesError] = useState("")
   const [gitProjectPath, setGitProjectPath] = useState(library.projects[0]?.path || "")
   const [gitRemoteUrl, setGitRemoteUrl] = useState(defaultGitSettings.remoteUrl)
   const [gitBranch, setGitBranch] = useState(defaultGitSettings.branch)
@@ -81,6 +89,9 @@ export function SettingsPage({
   const [isSavingGit, setIsSavingGit] = useState(false)
   const [gitMessage, setGitMessage] = useState("")
   const [gitError, setGitError] = useState("")
+  const [isReleasingWorkspace, setIsReleasingWorkspace] = useState(false)
+  const [recoveryMessage, setRecoveryMessage] = useState("")
+  const [recoveryError, setRecoveryError] = useState("")
 
   useEffect(() => {
     window.authorDesk.settings.getApi()
@@ -147,6 +158,17 @@ export function SettingsPage({
   }, [])
 
   useEffect(() => {
+    window.authorDesk.settings.getAiPreferences()
+      .then((preferences) => setAutoConfirmAiChanges(preferences.autoConfirmChanges))
+      .catch((loadError) => {
+        setAiPreferencesError(
+          loadError instanceof Error ? loadError.message : "无法读取 AI 修改确认设置",
+        )
+      })
+      .finally(() => setIsLoadingAiPreferences(false))
+  }, [])
+
+  useEffect(() => {
     function handleCloseBehaviorChanged(event: Event) {
       const nextBehavior = (event as CustomEvent<CloseBehavior>).detail
       if (["ask", "tray", "quit"].includes(nextBehavior)) {
@@ -180,6 +202,34 @@ export function SettingsPage({
       )
     } finally {
       setIsSavingCloseBehavior(false)
+    }
+  }
+
+  async function saveAiPreferences(nextAutoConfirm: boolean) {
+    if (isSavingAiPreferences || nextAutoConfirm === autoConfirmAiChanges) return
+    const previousValue = autoConfirmAiChanges
+    setAutoConfirmAiChanges(nextAutoConfirm)
+    setIsSavingAiPreferences(true)
+    setAiPreferencesMessage("")
+    setAiPreferencesError("")
+    try {
+      const saved = await window.authorDesk.settings.saveAiPreferences({
+        autoConfirmChanges: nextAutoConfirm,
+      })
+      setAutoConfirmAiChanges(saved.autoConfirmChanges)
+      setAiPreferencesMessage(
+        saved.autoConfirmChanges ? "已开启自动确认修改" : "已恢复手动确认修改",
+      )
+      window.dispatchEvent(new CustomEvent("author-desk:ai-preferences-changed", {
+        detail: saved,
+      }))
+    } catch (saveError) {
+      setAutoConfirmAiChanges(previousValue)
+      setAiPreferencesError(
+        saveError instanceof Error ? saveError.message : "保存 AI 修改确认设置失败",
+      )
+    } finally {
+      setIsSavingAiPreferences(false)
     }
   }
 
@@ -240,6 +290,33 @@ export function SettingsPage({
       setGitError(saveError instanceof Error ? saveError.message : "保存内置 Git 设置失败")
     } finally {
       setIsSavingGit(false)
+    }
+  }
+
+  async function forceReleaseWorkspace() {
+    if (isReleasingWorkspace) return
+    if (!window.confirm(
+      "强制解除会中止当前正在运行的 AI 请求，并清除正文与 AI 输入区域的临时占用状态。\n\n当前正文、聊天记录、待发送内容和已生成的待确认 diff 不会被删除。确定继续吗？",
+    )) return
+    setIsReleasingWorkspace(true)
+    setRecoveryMessage("")
+    setRecoveryError("")
+    try {
+      const result = await window.authorDesk.settings.forceReleaseWorkspace()
+      window.dispatchEvent(new CustomEvent("author-desk:force-release-workspace", {
+        detail: result,
+      }))
+      setRecoveryMessage(
+        result.abortedAiRequests > 0
+          ? `已解除占用，并中止 ${result.abortedAiRequests} 个残留 AI 请求。`
+          : "已解除正文与 AI 写作区域的临时占用状态。",
+      )
+    } catch (releaseError) {
+      setRecoveryError(
+        releaseError instanceof Error ? releaseError.message : "强制解除占用失败",
+      )
+    } finally {
+      setIsReleasingWorkspace(false)
     }
   }
 
@@ -379,6 +456,132 @@ export function SettingsPage({
                   <span className="text-muted-foreground">
                     弹窗中的“记住我的选择”也会同步修改这里。
                   </span>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-border bg-white p-6" aria-labelledby="ai-confirm-settings-title">
+          <div className="flex items-start gap-4">
+            <div className="grid size-11 shrink-0 place-items-center rounded-xl bg-secondary text-primary">
+              <FileCheck2 className="size-5" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-start justify-between gap-5">
+                <div>
+                  <h2 id="ai-confirm-settings-title" className="text-base font-semibold">AI 修改确认</h2>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    控制 AI 准备好文件差异后，是直接保存还是等待你手动检查。
+                  </p>
+                </div>
+                {isLoadingAiPreferences ? (
+                  <LoaderCircle className="mt-1 size-4 animate-spin text-primary" />
+                ) : (
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={autoConfirmAiChanges}
+                    aria-label="自动确认 AI 修改"
+                    disabled={isSavingAiPreferences}
+                    className={`relative mt-0.5 h-7 w-12 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-wait disabled:opacity-60 ${
+                      autoConfirmAiChanges ? "bg-primary" : "bg-muted-foreground/25"
+                    }`}
+                    onClick={() => saveAiPreferences(!autoConfirmAiChanges)}
+                  >
+                    <span
+                      className={`absolute top-1 grid size-5 place-items-center rounded-full bg-white shadow-sm transition-transform ${
+                        autoConfirmAiChanges ? "translate-x-6" : "translate-x-1"
+                      }`}
+                    >
+                      {isSavingAiPreferences && <LoaderCircle className="size-3 animate-spin text-primary" />}
+                    </span>
+                  </button>
+                )}
+              </div>
+
+              <div className={`mt-5 rounded-xl border px-4 py-4 ${
+                autoConfirmAiChanges
+                  ? "border-amber-200 bg-amber-50/55"
+                  : "border-border bg-muted/25"
+              }`}>
+                <div className="flex items-center gap-2">
+                  <span className={`grid size-7 place-items-center rounded-lg ${
+                    autoConfirmAiChanges
+                      ? "bg-amber-100 text-amber-700"
+                      : "bg-white text-muted-foreground"
+                  }`}>
+                    <ShieldCheck className="size-3.5" />
+                  </span>
+                  <p className="text-sm font-semibold">
+                    {autoConfirmAiChanges ? "自动确认并写入文件" : "检查差异后手动确认"}
+                  </p>
+                  <span className={`ml-auto rounded-full px-2.5 py-1 text-[10px] font-medium ${
+                    autoConfirmAiChanges
+                      ? "bg-amber-100 text-amber-700"
+                      : "bg-secondary text-primary"
+                  }`}>
+                    {autoConfirmAiChanges ? "已开启" : "默认方式"}
+                  </span>
+                </div>
+                <p className="mt-2 pl-9 text-[11px] leading-5 text-muted-foreground">
+                  {autoConfirmAiChanges
+                    ? "AI 回复完成后会自动保存整组修改。若正文有未保存内容、文件发生冲突或写入失败，仍会保留待确认状态供你手动处理。"
+                    : "AI 只会准备修改和差异，你可以查看红删绿增内容后选择“保存修改”或“取消修改”。"}
+                </p>
+              </div>
+
+              <div className="mt-3 min-h-4 text-xs" aria-live="polite">
+                {aiPreferencesError ? (
+                  <span className="text-destructive">{aiPreferencesError}</span>
+                ) : aiPreferencesMessage ? (
+                  <span className="text-success">{aiPreferencesMessage}</span>
+                ) : (
+                  <span className="text-muted-foreground">设置会立即保存并应用到下一组 AI 文件修改。</span>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-amber-200/80 bg-amber-50/25 p-6" aria-labelledby="workspace-recovery-title">
+          <div className="flex items-start gap-4">
+            <div className="grid size-11 shrink-0 place-items-center rounded-xl bg-amber-100 text-amber-700">
+              <ShieldAlert className="size-5" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-start justify-between gap-5">
+                <div>
+                  <h2 id="workspace-recovery-title" className="text-base font-semibold">故障恢复</h2>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    当正文编辑器或 AI 写作助手一直显示加载、保存、运行中时，可强制清除临时占用状态。
+                  </p>
+                </div>
+                <Button
+                  variant="outline"
+                  className="shrink-0 border-amber-300 bg-white text-amber-800 hover:bg-amber-100 hover:text-amber-900"
+                  disabled={isReleasingWorkspace}
+                  onClick={forceReleaseWorkspace}
+                >
+                  {isReleasingWorkspace
+                    ? <LoaderCircle className="size-4 animate-spin" />
+                    : <RotateCcw className="size-4" />}
+                  {isReleasingWorkspace ? "正在解除" : "强制解除占用"}
+                </Button>
+              </div>
+
+              <div className="mt-4 rounded-xl border border-amber-200/70 bg-white/75 px-4 py-3 text-xs leading-5 text-amber-900/80">
+                <p>保留：当前正文、AI 输入内容、聊天记录、待发送内容、待确认差异。</p>
+                <p>清除：卡住的加载/保存标记、AI 运行状态和当前窗口残留请求。</p>
+              </div>
+
+              <div className="mt-3 min-h-4 text-xs" aria-live="polite">
+                {recoveryError ? (
+                  <span className="text-destructive">{recoveryError}</span>
+                ) : recoveryMessage ? (
+                  <span className="text-success">{recoveryMessage}</span>
+                ) : (
+                  <span className="text-muted-foreground">仅用于界面长时间无法恢复时，正常运行时无需操作。</span>
                 )}
               </div>
             </div>

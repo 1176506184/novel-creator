@@ -62,6 +62,33 @@ export type ChapterDocument = ChapterSummary & {
   content: string
 }
 
+export type ChapterHistoryEntry = {
+  id: string
+  createdAt: string
+  characterCount: number
+  byteSize: number
+}
+
+export type ChapterHistoryState = {
+  ok: boolean
+  chapterName: string
+  limit: number
+  entries: ChapterHistoryEntry[]
+}
+
+export type ChapterHistoryDetail = ChapterHistoryEntry & {
+  ok: boolean
+  diff: string
+  sameAsCurrent: boolean
+}
+
+export type RestoreChapterHistoryResult = {
+  ok: boolean
+  restoredFrom: string
+  document: ChapterDocument
+  history: ChapterHistoryState
+}
+
 export type CharacterProfile = {
   id: string
   name: string
@@ -215,16 +242,25 @@ export type BookBreakdownState = {
   sourceName: string
   sourceBytes: number
   characterCount: number
+  detectionMethod: "headings" | "fallback"
+  detectedChapterCount: number
+  selectedChapterCount: number
+  selectedCharacterCount: number
+  chapterTitles: string[]
   importedAt: string | null
   generatedAt: string | null
+  styleGeneratedAt: string | null
+  styleSampledCharacters: number
+  styleError: string
   model: string
   analyzedChunks: number
   report: BookBreakdownReport | null
+  styleProfile: ReferenceStyleProfile | null
 }
 
 export type BookBreakdownProgress = {
   requestId: string
-  phase: "reading" | "splitting" | "analyzing" | "synthesizing" | "saving" | "retrying" | "complete"
+  phase: "reading" | "splitting" | "analyzing" | "synthesizing" | "style" | "saving" | "retrying" | "complete"
   label: string
   completed?: number
   total?: number

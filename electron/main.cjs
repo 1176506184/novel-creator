@@ -46,6 +46,7 @@ const WRITING_RULE_DISCOVERY_PATTERN = /^rules-.*\.md$/i
 const WRITING_RULE_IGNORED_DIRECTORIES = new Set([
   ".git",
   ".chat",
+  ".history",
   "node_modules",
   "release",
   "dist",
@@ -131,6 +132,22 @@ function setCloseBehavior(closeBehavior) {
   if (!CLOSE_BEHAVIORS.has(closeBehavior)) throw new Error("关闭行为设置无效")
   writeDesktopSettings({ closeBehavior })
   return closeBehavior
+}
+
+function getAiPreferences() {
+  const preferences = readDesktopSettings().aiPreferences || {}
+  return {
+    autoConfirmChanges: preferences.autoConfirmChanges === true,
+  }
+}
+
+function saveAiPreferences(input) {
+  if (!input || typeof input !== "object") throw new Error("AI 修改确认设置无效")
+  const preferences = {
+    autoConfirmChanges: input.autoConfirmChanges === true,
+  }
+  writeDesktopSettings({ aiPreferences: preferences })
+  return preferences
 }
 
 function getApiConfig() {
@@ -267,6 +284,8 @@ function saveStoredGitConfig(input) {
 }
 
 const AI_FILE_EXTENSIONS = new Set([".txt", ".md", ".markdown"])
+const CHAPTER_HISTORY_LIMIT = 10
+const CHAPTER_HISTORY_ID_PATTERN = /^(\d{13})-([0-9a-f]{8})\.txt$/
 const AI_CHAT_TOOLS = [
   {
     type: "function",
@@ -454,6 +473,275 @@ function createTextDiff(relativePath, beforeContent, afterContent) {
     lines.push(` ${after[index]}`)
   }
   return lines.join("\n").slice(0, 80_000)
+}
+
+function normalizeChapterHistoryName(chapterNameInput) {
+  const chapterName = String(chapterNameInput || "").trim()
+  if (
+    !chapterName
+    || path.basename(chapterName) !== chapterName
+    || !AI_FILE_EXTENSIONS.has(path.extname(chapterName).toLowerCase())
+  ) {
+    throw new Error("章节文件名无效")
+  }
+  return chapterName
+}
+
+async function resolveChapterForHistory(projectPathInput, chapterNameInput) {
+  if (typeof projectPathInput !== "string" || !isPathInsideLibrary(projectPathInput)) {
+    throw new Error("作品目录不在当前小说库中")
+  }
+  const projectPath = path.resolve(projectPathInput)
+  const chapterName = normalizeChapterHistoryName(chapterNameInput)
+  const manuscriptPath = path.join(projectPath, "正文")
+  const chapterPath = path.resolve(manuscriptPath, chapterName)
+  const relativePath = path.relative(manuscriptPath, chapterPath)
+  if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+    throw new Error("章节路径无效")
+  }
+
+  const [realProjectPath, realManuscriptPath, realChapterPath] = await Promise.all([
+    fs.promises.realpath(projectPath),
+    fs.promises.realpath(manuscriptPath),
+    fs.promises.realpath(chapterPath),
+  ])
+  if (!isPathContained(realProjectPath, realManuscriptPath)) {
+    throw new Error("正文目录指向当前作品之外")
+  }
+  if (!isPathContained(realManuscriptPath, realChapterPath)) {
+    throw new Error("章节文件指向正文目录之外")
+  }
+  const stats = await fs.promises.stat(realChapterPath)
+  if (!stats.isFile()) throw new Error("目标章节不是文件")
+  if (stats.size > 5 * 1024 * 1024) throw new Error("章节内容超过 5MB 限制")
+  return {
+    projectPath,
+    chapterName,
+    realProjectPath,
+    chapterPath: realChapterPath,
+  }
+}
+
+function chapterHistoryDirectoryPath(realProjectPath, chapterName) {
+  const chapterKey = createHash("sha256")
+    .update(chapterName.normalize("NFC").toLocaleLowerCase("zh-CN"))
+    .digest("hex")
+    .slice(0, 24)
+  return path.join(realProjectPath, ".history", "chapters", chapterKey)
+}
+
+async function assertSafeHistoryDirectory(realProjectPath, directoryPath) {
+  const relativeDirectory = path.relative(realProjectPath, directoryPath)
+  if (!relativeDirectory || relativeDirectory.startsWith("..") || path.isAbsolute(relativeDirectory)) {
+    throw new Error("章节历史目录无效")
+  }
+  let currentPath = realProjectPath
+  for (const segment of relativeDirectory.split(path.sep)) {
+    currentPath = path.join(currentPath, segment)
+    try {
+      const stats = await fs.promises.lstat(currentPath)
+      if (stats.isSymbolicLink() || !stats.isDirectory()) {
+        throw new Error("章节历史目录不能是符号链接或普通文件")
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error
+      await fs.promises.mkdir(currentPath)
+    }
+  }
+  const realDirectoryPath = await fs.promises.realpath(directoryPath)
+  if (!isPathContained(realProjectPath, realDirectoryPath)) {
+    throw new Error("章节历史目录指向当前作品之外")
+  }
+  return realDirectoryPath
+}
+
+async function getChapterHistoryDirectory(context, { create = false } = {}) {
+  const directoryPath = chapterHistoryDirectoryPath(
+    context.realProjectPath,
+    context.chapterName,
+  )
+  if (create) return assertSafeHistoryDirectory(context.realProjectPath, directoryPath)
+  try {
+    const stats = await fs.promises.lstat(directoryPath)
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      throw new Error("章节历史目录不能是符号链接或普通文件")
+    }
+    const realDirectoryPath = await fs.promises.realpath(directoryPath)
+    if (!isPathContained(context.realProjectPath, realDirectoryPath)) {
+      throw new Error("章节历史目录指向当前作品之外")
+    }
+    return realDirectoryPath
+  } catch (error) {
+    if (error.code === "ENOENT") return null
+    throw error
+  }
+}
+
+async function readChapterHistoryFiles(context) {
+  const historyDirectory = await getChapterHistoryDirectory(context)
+  if (!historyDirectory) return []
+  const entries = await fs.promises.readdir(historyDirectory, { withFileTypes: true })
+  return entries
+    .filter((entry) => entry.isFile() && CHAPTER_HISTORY_ID_PATTERN.test(entry.name))
+    .map((entry) => entry.name)
+    .sort((left, right) => right.localeCompare(left))
+}
+
+async function readChapterHistoryContent(context, historyIdInput) {
+  const historyId = String(historyIdInput || "")
+  if (!CHAPTER_HISTORY_ID_PATTERN.test(historyId)) throw new Error("章节历史版本无效")
+  const historyDirectory = await getChapterHistoryDirectory(context)
+  if (!historyDirectory) throw new Error("章节历史版本不存在")
+  const historyPath = path.resolve(historyDirectory, historyId)
+  const relativePath = path.relative(historyDirectory, historyPath)
+  if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+    throw new Error("章节历史版本路径无效")
+  }
+  let stats
+  try {
+    stats = await fs.promises.lstat(historyPath)
+  } catch (error) {
+    if (error.code === "ENOENT") throw new Error("章节历史版本不存在")
+    throw error
+  }
+  if (stats.isSymbolicLink() || !stats.isFile()) throw new Error("章节历史版本不是普通文件")
+  if (stats.size > 5 * 1024 * 1024) throw new Error("章节历史版本超过 5MB 限制")
+  return fs.promises.readFile(historyPath, "utf8")
+}
+
+async function recordChapterHistory(context, previousContent) {
+  if (typeof previousContent !== "string" || previousContent.length === 0) return null
+  const historyDirectory = await getChapterHistoryDirectory(context, { create: true })
+  const existingFiles = await readChapterHistoryFiles(context)
+  if (existingFiles[0]) {
+    const latestContent = await fs.promises.readFile(
+      path.join(historyDirectory, existingFiles[0]),
+      "utf8",
+    )
+    if (latestContent === previousContent) return existingFiles[0]
+  }
+
+  const chapterStats = await fs.promises.stat(context.chapterPath)
+  const modifiedTime = Number.isFinite(chapterStats.mtimeMs)
+    ? Math.max(0, Math.floor(chapterStats.mtimeMs))
+    : Date.now()
+  const historyTimeId = String(modifiedTime).padStart(13, "0")
+  const historyId = `${historyTimeId}-${randomUUID().replace(/-/g, "").slice(0, 8)}.txt`
+  await fs.promises.writeFile(path.join(historyDirectory, historyId), previousContent, {
+    encoding: "utf8",
+    flag: "wx",
+  })
+  const historyFiles = [historyId, ...existingFiles]
+    .sort((left, right) => right.localeCompare(left))
+  await Promise.all(historyFiles.slice(CHAPTER_HISTORY_LIMIT).map((fileName) => (
+    fs.promises.unlink(path.join(historyDirectory, fileName)).catch(() => {})
+  )))
+  return historyId
+}
+
+function chapterHistorySummary(historyId, content) {
+  const match = historyId.match(CHAPTER_HISTORY_ID_PATTERN)
+  return {
+    id: historyId,
+    createdAt: new Date(Number(match?.[1] || 0)).toISOString(),
+    characterCount: content.replace(/\s/g, "").length,
+    byteSize: Buffer.byteLength(content, "utf8"),
+  }
+}
+
+async function listChapterHistory(projectPath, chapterName) {
+  const context = await resolveChapterForHistory(projectPath, chapterName)
+  const historyDirectory = await getChapterHistoryDirectory(context)
+  if (!historyDirectory) {
+    return { ok: true, chapterName: context.chapterName, limit: CHAPTER_HISTORY_LIMIT, entries: [] }
+  }
+  const historyFiles = (await readChapterHistoryFiles(context)).slice(0, CHAPTER_HISTORY_LIMIT)
+  const entries = await Promise.all(historyFiles.map(async (historyId) => {
+    const content = await fs.promises.readFile(path.join(historyDirectory, historyId), "utf8")
+    return chapterHistorySummary(historyId, content)
+  }))
+  return {
+    ok: true,
+    chapterName: context.chapterName,
+    limit: CHAPTER_HISTORY_LIMIT,
+    entries,
+  }
+}
+
+async function readChapterHistoryEntry(projectPath, chapterName, historyIdInput) {
+  const context = await resolveChapterForHistory(projectPath, chapterName)
+  const historyId = String(historyIdInput || "")
+  const [historicalContent, currentContent] = await Promise.all([
+    readChapterHistoryContent(context, historyId),
+    fs.promises.readFile(context.chapterPath, "utf8"),
+  ])
+  return {
+    ok: true,
+    ...chapterHistorySummary(historyId, historicalContent),
+    diff: createTextDiff(`正文/${context.chapterName}`, historicalContent, currentContent),
+    sameAsCurrent: historicalContent === currentContent,
+  }
+}
+
+async function writeChapterContent(context, content) {
+  const temporaryPath = `${context.chapterPath}.${process.pid}.${Date.now()}.tmp`
+  await fs.promises.writeFile(temporaryPath, content, "utf8")
+  try {
+    await fs.promises.rename(temporaryPath, context.chapterPath)
+  } catch (error) {
+    await fs.promises.unlink(temporaryPath).catch(() => {})
+    throw error
+  }
+  const stats = await fs.promises.stat(context.chapterPath)
+  return {
+    ok: true,
+    name: context.chapterName,
+    path: context.chapterPath,
+    content,
+    characterCount: content.replace(/\s/g, "").length,
+    modifiedAt: stats.mtime.toISOString(),
+  }
+}
+
+async function saveChapterWithHistory(projectPath, chapterName, contentInput) {
+  if (typeof contentInput !== "string") throw new Error("章节内容无效")
+  if (Buffer.byteLength(contentInput, "utf8") > 5 * 1024 * 1024) {
+    throw new Error("章节内容超过 5MB 限制")
+  }
+  const context = await resolveChapterForHistory(projectPath, chapterName)
+  const currentContent = await fs.promises.readFile(context.chapterPath, "utf8")
+  if (currentContent === contentInput) return writeChapterContent(context, contentInput)
+  await recordChapterHistory(context, currentContent)
+  return writeChapterContent(context, contentInput)
+}
+
+async function restoreChapterHistory(projectPath, chapterName, historyIdInput) {
+  const context = await resolveChapterForHistory(projectPath, chapterName)
+  const historyId = String(historyIdInput || "")
+  const [historicalContent, currentContent] = await Promise.all([
+    readChapterHistoryContent(context, historyId),
+    fs.promises.readFile(context.chapterPath, "utf8"),
+  ])
+  if (historicalContent !== currentContent) {
+    await recordChapterHistory(context, currentContent)
+    await writeChapterContent(context, historicalContent)
+  }
+  return {
+    ok: true,
+    restoredFrom: historyId,
+    document: await (async () => {
+      const stats = await fs.promises.stat(context.chapterPath)
+      return {
+        ok: true,
+        name: context.chapterName,
+        path: context.chapterPath,
+        content: historicalContent,
+        characterCount: historicalContent.replace(/\s/g, "").length,
+        modifiedAt: stats.mtime.toISOString(),
+      }
+    })(),
+    history: await listChapterHistory(projectPath, chapterName),
+  }
 }
 
 function getAiPendingChangesDirectory(projectPath) {
@@ -680,6 +968,11 @@ async function applyAiPendingChangeSet(projectPath, changeSetIdInput) {
         flag: "wx",
       })
     } else {
+      const relativeParts = change.relativePath.replace(/\\/g, "/").split("/")
+      if (relativeParts.length === 2 && relativeParts[0] === "正文") {
+        const chapterContext = await resolveChapterForHistory(projectPath, relativeParts[1])
+        await recordChapterHistory(chapterContext, change.beforeContent)
+      }
       await fs.promises.writeFile(change.targetPath, change.afterContent, "utf8")
     }
   }
@@ -1543,14 +1836,19 @@ async function requestAiChat(input, onProgress = () => {}, signal, steeringSessi
   let characterMemory = ""
   let writingRules = ""
   let referenceStyle = ""
-  const [characterState, rulesState, referenceStyleState] = await Promise.all([
+  const [characterState, rulesState, referenceStyleState, bookBreakdownState] = await Promise.all([
     getCharacterGraph(projectPath).catch(() => null),
     readWritingRules(projectPath).catch(() => null),
     getReferenceStyle(projectPath).catch(() => null),
+    getBookBreakdown(projectPath).catch(() => null),
   ])
   if (characterState) characterMemory = createCharacterMemoryPrompt(characterState.graph)
   if (rulesState) writingRules = createWritingRulesPrompt(rulesState)
-  if (referenceStyleState) referenceStyle = createReferenceStylePrompt(referenceStyleState)
+  if (bookBreakdownState?.styleProfile) {
+    referenceStyle = createReferenceStylePrompt({ profile: bookBreakdownState.styleProfile })
+  } else if (referenceStyleState) {
+    referenceStyle = createReferenceStylePrompt(referenceStyleState)
+  }
   const apiMessages = [
     {
       role: "system",
@@ -2985,6 +3283,82 @@ function bookBreakdownProgressPath(projectPath) {
   return path.join(bookBreakdownDirectory(projectPath), ".拆书进度.json")
 }
 
+const BOOK_BREAKDOWN_CHAPTER_HEADING_PATTERN = /^[ \t　]*(?:(?:第[ \t　]*[0-9０-９一二三四五六七八九十百千万零〇两壹贰叁肆伍陆柒捌玖拾佰仟]+[ \t　]*[章节回])(?:[ \t　:：、._-]*[^\r\n]{0,80})?|(?:chapter|chap\.)[ \t　]*\d+(?:[ \t　:：._-]+[^\r\n]{0,80})?|(?:序章|楔子|引子|前言|终章|尾声|后记|番外(?:[ \t　:：、._-]*[^\r\n]{0,40})?))[ \t　]*$/gim
+
+function detectBookBreakdownChapters(contentInput) {
+  const content = String(contentInput || "")
+  const matches = []
+  BOOK_BREAKDOWN_CHAPTER_HEADING_PATTERN.lastIndex = 0
+  let match
+  while ((match = BOOK_BREAKDOWN_CHAPTER_HEADING_PATTERN.exec(content))) {
+    matches.push({
+      title: match[0].trim().replace(/\s+/g, " ").slice(0, 100),
+      start: match.index,
+    })
+    if (matches.length >= 10_000) break
+  }
+  if (matches.length < 2) return { method: "fallback", chapters: [] }
+
+  const candidates = matches.map((item, index) => {
+    const end = matches[index + 1]?.start ?? content.length
+    const body = content.slice(item.start, end)
+    return {
+      ...item,
+      end,
+      characterCount: body.replace(/\s/g, "").length,
+      normalizedTitle: item.title.replace(/[\s　:：、._-]/g, "").toLocaleLowerCase("zh-CN"),
+    }
+  })
+  const bestByTitle = new Map()
+  for (const chapter of candidates) {
+    if (chapter.characterCount < 200) continue
+    const previous = bestByTitle.get(chapter.normalizedTitle)
+    if (!previous || previous.characterCount < chapter.characterCount) {
+      bestByTitle.set(chapter.normalizedTitle, chapter)
+    }
+  }
+  const chapters = [...bestByTitle.values()]
+    .sort((left, right) => left.start - right.start)
+    .map(({ normalizedTitle: _normalizedTitle, ...chapter }, index) => ({
+      ...chapter,
+      index,
+    }))
+  if (chapters.length < 2) return { method: "fallback", chapters: [] }
+  return { method: "headings", chapters }
+}
+
+function selectBookBreakdownRange(contentInput, chapterLimitInput) {
+  const content = String(contentInput || "").replace(/\u0000/g, "").trim()
+  const detection = detectBookBreakdownChapters(content)
+  if (detection.method !== "headings" || !detection.chapters.length) {
+    return {
+      content,
+      detectionMethod: "fallback",
+      detectedChapterCount: 0,
+      selectedChapterCount: 0,
+      selectedCharacterCount: content.length,
+      chapterTitles: [],
+    }
+  }
+  const detectedChapterCount = detection.chapters.length
+  const requestedLimit = Math.floor(Number(chapterLimitInput) || 0)
+  const selectedChapterCount = Math.min(
+    detectedChapterCount,
+    Math.max(1, requestedLimit || Math.min(50, detectedChapterCount)),
+  )
+  const firstChapter = detection.chapters[0]
+  const lastChapter = detection.chapters[selectedChapterCount - 1]
+  const selectedContent = content.slice(firstChapter.start, lastChapter.end).trim()
+  return {
+    content: selectedContent,
+    detectionMethod: "headings",
+    detectedChapterCount,
+    selectedChapterCount,
+    selectedCharacterCount: selectedContent.length,
+    chapterTitles: detection.chapters.slice(0, 20).map((chapter) => chapter.title),
+  }
+}
+
 function emptyBookBreakdownState(projectPath) {
   return {
     exists: false,
@@ -2994,11 +3368,20 @@ function emptyBookBreakdownState(projectPath) {
     sourceName: "",
     sourceBytes: 0,
     characterCount: 0,
+    detectionMethod: "fallback",
+    detectedChapterCount: 0,
+    selectedChapterCount: 0,
+    selectedCharacterCount: 0,
+    chapterTitles: [],
     importedAt: null,
     generatedAt: null,
+    styleGeneratedAt: null,
+    styleSampledCharacters: 0,
+    styleError: "",
     model: "",
     analyzedChunks: 0,
     report: null,
+    styleProfile: null,
   }
 }
 
@@ -3089,6 +3472,15 @@ async function getBookBreakdown(projectPath) {
   const statePath = bookBreakdownStatePath(projectPath)
   try {
     const data = JSON.parse(await fs.promises.readFile(statePath, "utf8"))
+    let detectedRange = null
+    if (!Number.isFinite(data?.detectedChapterCount) && data?.sourcePath) {
+      try {
+        const sourceContent = await fs.promises.readFile(bookBreakdownSourcePath(projectPath), "utf8")
+        detectedRange = selectBookBreakdownRange(sourceContent, data?.selectedChapterCount)
+      } catch {
+        detectedRange = null
+      }
+    }
     return {
       exists: true,
       path: statePath,
@@ -3099,13 +3491,36 @@ async function getBookBreakdown(projectPath) {
       characterCount: Number.isFinite(data?.characterCount)
         ? Math.max(0, Math.floor(data.characterCount))
         : 0,
+      detectionMethod: data?.detectionMethod === "headings"
+        ? "headings"
+        : detectedRange?.detectionMethod || "fallback",
+      detectedChapterCount: Number.isFinite(data?.detectedChapterCount)
+        ? Math.max(0, Math.floor(data.detectedChapterCount))
+        : detectedRange?.detectedChapterCount || 0,
+      selectedChapterCount: Number.isFinite(data?.selectedChapterCount)
+        ? Math.max(0, Math.floor(data.selectedChapterCount))
+        : detectedRange?.selectedChapterCount || 0,
+      selectedCharacterCount: Number.isFinite(data?.selectedCharacterCount)
+        ? Math.max(0, Math.floor(data.selectedCharacterCount))
+        : detectedRange?.selectedCharacterCount || 0,
+      chapterTitles: Array.isArray(data?.chapterTitles)
+        ? data.chapterTitles.map((item) => String(item || "")).filter(Boolean).slice(0, 20)
+        : detectedRange?.chapterTitles || [],
       importedAt: typeof data?.importedAt === "string" ? data.importedAt : null,
       generatedAt: typeof data?.generatedAt === "string" ? data.generatedAt : null,
+      styleGeneratedAt: typeof data?.styleGeneratedAt === "string" ? data.styleGeneratedAt : null,
+      styleSampledCharacters: Number.isFinite(data?.styleSampledCharacters)
+        ? Math.max(0, Math.floor(data.styleSampledCharacters))
+        : 0,
+      styleError: typeof data?.styleError === "string" ? data.styleError.slice(0, 1_000) : "",
       model: typeof data?.model === "string" ? data.model : "",
       analyzedChunks: Number.isFinite(data?.analyzedChunks)
         ? Math.max(0, Math.floor(data.analyzedChunks))
         : 0,
       report: data?.report ? normalizeBookBreakdownReport(data.report) : null,
+      styleProfile: data?.styleProfile
+        ? normalizeReferenceStyleProfile(data.styleProfile)
+        : null,
     }
   } catch (error) {
     if (error?.code === "ENOENT") return emptyBookBreakdownState(projectPath)
@@ -3116,20 +3531,41 @@ async function getBookBreakdown(projectPath) {
 async function writeBookBreakdown(projectPath, state) {
   const statePath = bookBreakdownStatePath(projectPath)
   const normalized = {
-    version: 1,
+    version: 2,
     sourcePath: String(state?.sourcePath || ""),
     sourceName: String(state?.sourceName || ""),
     sourceBytes: Number.isFinite(state?.sourceBytes) ? Math.max(0, state.sourceBytes) : 0,
     characterCount: Number.isFinite(state?.characterCount)
       ? Math.max(0, Math.floor(state.characterCount))
       : 0,
+    detectionMethod: state?.detectionMethod === "headings" ? "headings" : "fallback",
+    detectedChapterCount: Number.isFinite(state?.detectedChapterCount)
+      ? Math.max(0, Math.floor(state.detectedChapterCount))
+      : 0,
+    selectedChapterCount: Number.isFinite(state?.selectedChapterCount)
+      ? Math.max(0, Math.floor(state.selectedChapterCount))
+      : 0,
+    selectedCharacterCount: Number.isFinite(state?.selectedCharacterCount)
+      ? Math.max(0, Math.floor(state.selectedCharacterCount))
+      : 0,
+    chapterTitles: Array.isArray(state?.chapterTitles)
+      ? state.chapterTitles.map((item) => String(item || "")).filter(Boolean).slice(0, 20)
+      : [],
     importedAt: typeof state?.importedAt === "string" ? state.importedAt : null,
     generatedAt: typeof state?.generatedAt === "string" ? state.generatedAt : null,
+    styleGeneratedAt: typeof state?.styleGeneratedAt === "string" ? state.styleGeneratedAt : null,
+    styleSampledCharacters: Number.isFinite(state?.styleSampledCharacters)
+      ? Math.max(0, Math.floor(state.styleSampledCharacters))
+      : 0,
+    styleError: typeof state?.styleError === "string" ? state.styleError.slice(0, 1_000) : "",
     model: String(state?.model || ""),
     analyzedChunks: Number.isFinite(state?.analyzedChunks)
       ? Math.max(0, Math.floor(state.analyzedChunks))
       : 0,
     report: state?.report ? normalizeBookBreakdownReport(state.report) : null,
+    styleProfile: state?.styleProfile
+      ? normalizeReferenceStyleProfile(state.styleProfile)
+      : null,
   }
   await fs.promises.mkdir(path.dirname(statePath), { recursive: true })
   await fs.promises.writeFile(statePath, `${JSON.stringify(normalized, null, 2)}\n`, "utf8")
@@ -3164,6 +3600,7 @@ async function chooseBookBreakdownSource(projectPath) {
     .trim()
   if (content.length < 1_000) throw new Error("TXT 正文至少需要 1,000 个字符")
   if (content.length > 3_000_000) throw new Error("TXT 正文超过 300 万字符，请先拆分后再导入")
+  const detectedRange = selectBookBreakdownRange(content, 0)
 
   const directory = bookBreakdownDirectory(projectPath)
   const sourcePath = bookBreakdownSourcePath(projectPath)
@@ -3175,11 +3612,20 @@ async function chooseBookBreakdownSource(projectPath) {
     sourceName: path.basename(selectedPath),
     sourceBytes: Buffer.byteLength(content, "utf8"),
     characterCount: content.length,
+    detectionMethod: detectedRange.detectionMethod,
+    detectedChapterCount: detectedRange.detectedChapterCount,
+    selectedChapterCount: detectedRange.selectedChapterCount,
+    selectedCharacterCount: detectedRange.selectedCharacterCount,
+    chapterTitles: detectedRange.chapterTitles,
     importedAt: new Date().toISOString(),
     generatedAt: null,
+    styleGeneratedAt: null,
+    styleSampledCharacters: 0,
+    styleError: "",
     model: "",
     analyzedChunks: 0,
     report: null,
+    styleProfile: null,
   })
 }
 
@@ -3216,6 +3662,148 @@ function splitBookBreakdownText(content) {
   return chunks
 }
 
+function sampleBookBreakdownStyle(contentInput, maximumCharacters = 72_000) {
+  const content = String(contentInput || "").trim()
+  if (content.length <= maximumCharacters) return content
+  const segmentCount = 8
+  const segmentLength = Math.floor(maximumCharacters / segmentCount)
+  const samples = []
+  for (let index = 0; index < segmentCount; index += 1) {
+    const ratio = segmentCount === 1 ? 0 : index / (segmentCount - 1)
+    const center = Math.floor(ratio * Math.max(0, content.length - segmentLength))
+    let start = Math.max(0, center)
+    if (start > 0) {
+      const nextBreak = content.indexOf("\n", start)
+      if (nextBreak >= 0 && nextBreak - start < 500) start = nextBreak + 1
+    }
+    samples.push(content.slice(start, start + segmentLength).trim())
+  }
+  return samples.filter(Boolean).join("\n\n（均匀取样分隔）\n\n").slice(0, maximumCharacters)
+}
+
+async function analyzeBookBreakdownStyleContent(
+  content,
+  sourceName,
+  rangeLabel,
+  config,
+  endpoint,
+  onProgress,
+  signal,
+) {
+  const sample = sampleBookBreakdownStyle(content)
+  if (sample.length < 1_000) throw new Error("所选章节没有足够正文用于总结文风")
+  onProgress({
+    phase: "style",
+    label: `正在总结${rangeLabel}的叙事文风…`,
+    completed: 0,
+    total: 1,
+  })
+  const assistantMessage = await requestAiCompletionWithRetry({
+    endpoint,
+    config,
+    signal,
+    maxRetries: 2,
+    timeoutMs: 180_000,
+    onProgress: (progress) => {
+      if (progress?.type === "status" && progress.label) {
+        onProgress({ phase: "retrying", label: `文风总结：${progress.label}` })
+      }
+    },
+    body: JSON.stringify({
+      model: config.model,
+      reasoning_effort: "medium",
+      messages: [
+        {
+          role: "system",
+          content: [
+            "你是小说文风分析器。请从参考小说样本中提炼可复用的高层写作规律。",
+            "只总结叙事、节奏、句式、视角、对话、描写、情绪和章节结构；不得复制原句，不得要求模仿专有角色、地名、设定或剧情。",
+            "必须只返回一个 JSON 对象，不使用 Markdown。",
+            "writingPrompt 要写成可以直接提供给小说写作 AI 的中文文风指令，具体、可执行，但必须保持原创。",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: [
+            `参考小说：${sourceName || "未命名 TXT"}`,
+            `分析范围：${rangeLabel}`,
+            "请按以下结构返回：",
+            JSON.stringify({
+              overview: "整体文风概述",
+              narrative: "叙事方式和信息释放习惯",
+              viewpoint: "人称与视角控制",
+              pacing: "节奏、冲突和悬念规律",
+              sentence: "句式长短、段落与语言密度",
+              dialogue: "对话比例、潜台词和人物区分方式",
+              description: "环境、动作、心理和感官描写偏好",
+              emotion: "情绪强度与递进方式",
+              vocabulary: "用词、语气与修辞倾向",
+              chapterStructure: "章节开头、中段、结尾的组织方式",
+              techniques: ["可借鉴技巧"],
+              avoid: ["使用这套文风时应避免的问题"],
+              writingPrompt: "供写作 AI 直接执行的完整原创文风指令",
+            }, null, 2),
+            "以下是从所选章节中均匀抽取的正文样本：",
+            sample,
+          ].join("\n\n"),
+        },
+      ],
+      max_tokens: 6_000,
+      stream: true,
+    }),
+  })
+  return {
+    profile: normalizeReferenceStyleProfile(
+      parseReferenceStyleResponse(assistantMessage?.content),
+    ),
+    sampledCharacters: sample.length,
+  }
+}
+
+async function requestBookBreakdownStyle(
+  projectPath,
+  chapterLimit,
+  onProgress = () => {},
+  signal,
+) {
+  const current = await getBookBreakdown(projectPath)
+  if (!current.sourcePath) throw new Error("请先导入本地 TXT 小说")
+  const fullContent = (await fs.promises.readFile(bookBreakdownSourcePath(projectPath), "utf8"))
+    .replace(/\u0000/g, "")
+    .trim()
+  const range = selectBookBreakdownRange(
+    fullContent,
+    chapterLimit || current.selectedChapterCount,
+  )
+  const rangeLabel = range.detectedChapterCount
+    ? `前 ${range.selectedChapterCount} 章`
+    : "全文（未识别到标准章节标题）"
+  const config = getApiRuntimeConfig()
+  const endpoint = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`
+  const style = await analyzeBookBreakdownStyleContent(
+    range.content,
+    current.sourceName,
+    rangeLabel,
+    config,
+    endpoint,
+    onProgress,
+    signal,
+  )
+  throwIfAiRequestCanceled(signal)
+  const nextState = await writeBookBreakdown(projectPath, {
+    ...current,
+    ...range,
+    content: undefined,
+    styleGeneratedAt: new Date().toISOString(),
+    styleSampledCharacters: style.sampledCharacters,
+    styleError: "",
+    model: config.model,
+    styleProfile: style.profile,
+  })
+  onProgress({ phase: "complete", label: "文风总结完成", completed: 1, total: 1 })
+  return nextState
+}
+
 async function analyzeBookBreakdownChunk(chunk, totalChunks, config, endpoint, onProgress, signal) {
   const assistantMessage = await requestAiCompletionWithRetry({
     endpoint,
@@ -3238,7 +3826,7 @@ async function analyzeBookBreakdownChunk(chunk, totalChunks, config, endpoint, o
         {
           role: "system",
           content: [
-            "你是中文小说拆书编辑。请分析给定的连续正文片段在整部故事中的剧情推进作用。",
+            "你是中文小说拆书编辑。请分析给定的连续正文片段在所选故事范围中的剧情推进作用。",
             "只概括事件、因果、冲突、转折、人物变化、伏笔和阶段结果，不评价文笔，不续写，不大段引用原文。",
             "必须只返回一个 JSON 对象，不使用 Markdown。",
           ].join("\n"),
@@ -3288,19 +3876,31 @@ async function analyzeBookBreakdownChunk(chunk, totalChunks, config, endpoint, o
   }
 }
 
-async function requestBookBreakdown(projectPath, onProgress = () => {}, signal) {
+async function requestBookBreakdown(
+  projectPath,
+  options = {},
+  onProgress = () => {},
+  signal,
+) {
   const current = await getBookBreakdown(projectPath)
   if (!current.sourcePath) throw new Error("请先导入本地 TXT 小说")
   onProgress({ phase: "reading", label: "正在读取本地 TXT…" })
   const sourcePath = bookBreakdownSourcePath(projectPath)
-  const content = (await fs.promises.readFile(sourcePath, "utf8")).replace(/\u0000/g, "").trim()
-  if (content.length < 1_000) throw new Error("本地 TXT 正文内容不足")
+  const fullContent = (await fs.promises.readFile(sourcePath, "utf8"))
+    .replace(/\u0000/g, "")
+    .trim()
+  if (fullContent.length < 1_000) throw new Error("本地 TXT 正文内容不足")
+  const selectedRange = selectBookBreakdownRange(fullContent, options.chapterLimit)
+  const content = selectedRange.content
+  const rangeLabel = selectedRange.detectedChapterCount
+    ? `前 ${selectedRange.selectedChapterCount} 章`
+    : "全文（未识别到标准章节标题）"
   const sourceHash = createHash("sha256").update(content).digest("hex")
   const chunks = splitBookBreakdownText(content)
   if (!chunks.length) throw new Error("无法从 TXT 中读取正文")
   onProgress({
     phase: "splitting",
-    label: `已将全文划分为 ${chunks.length} 个连续片段`,
+    label: `已识别${rangeLabel}，划分为 ${chunks.length} 个连续片段`,
     completed: 0,
     total: chunks.length,
   })
@@ -3445,7 +4045,7 @@ async function requestBookBreakdown(projectPath, onProgress = () => {}, signal) 
         {
           role: "system",
           content: [
-            "你是专业的中文小说拆书编辑。请根据按原文顺序排列的分段摘要，还原整部小说的故事发展结构。",
+            "你是专业的中文小说拆书编辑。请根据按原文顺序排列的分段摘要，还原所选连续章节范围内的故事发展结构。",
             "重点分析因果链、冲突升级、关键转折、人物弧线、伏笔回收、节奏变化和可复用的高层故事机制。",
             "可复用机制必须抽象，不得鼓励复制原作专有角色、名称、设定、原句或完全相同的事件排列。",
             "必须只返回一个 JSON 对象，不使用 Markdown。",
@@ -3455,13 +4055,13 @@ async function requestBookBreakdown(projectPath, onProgress = () => {}, signal) 
           role: "user",
           content: [
             `参考小说：${current.sourceName}`,
-            `全文约 ${content.length} 字，共 ${chunks.length} 个分析片段。`,
+            `分析范围：${rangeLabel}，约 ${content.length} 字，共 ${chunks.length} 个分析片段。`,
             "请严格按以下结构返回：",
             JSON.stringify({
-              overview: "全书故事发展概述",
+              overview: "所选章节范围的故事发展概述",
               premise: "一句话核心故事前提",
               themes: ["主题"],
-              centralConflict: "贯穿全书的核心冲突及其演变",
+              centralConflict: "贯穿所选范围的核心冲突及其演变",
               storyPhases: [{
                 name: "故事阶段名称",
                 range: "章节或剧情范围",
@@ -3495,7 +4095,7 @@ async function requestBookBreakdown(projectPath, onProgress = () => {}, signal) 
                 payoff: "如何回收",
                 effect: "产生的剧情效果",
               }],
-              pacing: "全书节奏、高潮密度和张弛规律",
+              pacing: "所选范围的节奏、高潮密度和张弛规律",
               reusablePatterns: [{
                 title: "可借鉴的高层机制",
                 mechanism: "抽象运作方式",
@@ -3517,19 +4117,59 @@ async function requestBookBreakdown(projectPath, onProgress = () => {}, signal) 
     parseBookBreakdownJson(finalMessage?.content),
   )
   throwIfAiRequestCanceled(signal)
-  onProgress({ phase: "saving", label: "正在保存拆书 JSON…" })
-  const nextState = await writeBookBreakdown(projectPath, {
+  onProgress({ phase: "saving", label: "正在保存情节拆解结果…" })
+  let nextState = await writeBookBreakdown(projectPath, {
     ...current,
     sourcePath,
-    sourceBytes: Buffer.byteLength(content, "utf8"),
-    characterCount: content.length,
+    sourceBytes: Buffer.byteLength(fullContent, "utf8"),
+    characterCount: fullContent.length,
+    detectionMethod: selectedRange.detectionMethod,
+    detectedChapterCount: selectedRange.detectedChapterCount,
+    selectedChapterCount: selectedRange.selectedChapterCount,
+    selectedCharacterCount: selectedRange.selectedCharacterCount,
+    chapterTitles: selectedRange.chapterTitles,
     generatedAt: new Date().toISOString(),
+    styleGeneratedAt: null,
+    styleSampledCharacters: 0,
+    styleError: "",
     model: config.model,
     analyzedChunks: chunks.length,
     report,
+    styleProfile: null,
   })
+  try {
+    const style = await analyzeBookBreakdownStyleContent(
+      content,
+      current.sourceName,
+      rangeLabel,
+      config,
+      endpoint,
+      onProgress,
+      signal,
+    )
+    throwIfAiRequestCanceled(signal)
+    nextState = await writeBookBreakdown(projectPath, {
+      ...nextState,
+      styleGeneratedAt: new Date().toISOString(),
+      styleSampledCharacters: style.sampledCharacters,
+      styleError: "",
+      styleProfile: style.profile,
+    })
+  } catch (styleError) {
+    if (signal?.aborted || styleError?.code === "AI_REQUEST_CANCELED") throw styleError
+    nextState = await writeBookBreakdown(projectPath, {
+      ...nextState,
+      styleGeneratedAt: null,
+      styleSampledCharacters: 0,
+      styleError: styleError instanceof Error ? styleError.message : String(styleError),
+      styleProfile: null,
+    })
+  }
   await fs.promises.unlink(progressPath).catch(() => {})
-  onProgress({ phase: "complete", label: "拆书完成" })
+  onProgress({
+    phase: "complete",
+    label: nextState.styleProfile ? "拆书与文风总结完成" : "情节拆解完成，文风总结可单独重试",
+  })
   return nextState
 }
 
@@ -5233,6 +5873,27 @@ ipcMain.handle("settings:get-api", () => getApiConfig())
 
 ipcMain.handle("settings:save-api", (_event, input) => saveApiConfig(input))
 
+ipcMain.handle("settings:get-ai-preferences", () => getAiPreferences())
+
+ipcMain.handle("settings:save-ai-preferences", (_event, input) => saveAiPreferences(input))
+
+ipcMain.handle("settings:force-release-workspace", (event) => {
+  const requestPrefix = `${event.sender.id}:`
+  let abortedAiRequests = 0
+  for (const [requestKey, session] of activeAiChatSessions.entries()) {
+    if (!requestKey.startsWith(requestPrefix)) continue
+    if (!session.controller.signal.aborted) {
+      session.controller.abort(createAiRequestCanceledError())
+      abortedAiRequests += 1
+    }
+    activeAiChatSessions.delete(requestKey)
+  }
+  return {
+    ok: true,
+    abortedAiRequests,
+  }
+})
+
 ipcMain.handle("ai:chat", async (event, input) => {
   const requestId = String(input?.requestId || "")
   if (!requestId) throw new Error("AI 请求 ID 无效")
@@ -5420,13 +6081,42 @@ ipcMain.handle("book-breakdown:analyze", async (event, input) => {
   const controller = new AbortController()
   activeBookBreakdownControllers.set(requestKey, controller)
   try {
-    return await requestBookBreakdown(projectPath, (progress) => {
+    return await requestBookBreakdown(projectPath, {
+      chapterLimit: input?.chapterLimit,
+    }, (progress) => {
       if (event.sender.isDestroyed()) return
       event.sender.send("book-breakdown:progress", {
         requestId,
         ...progress,
       })
     }, controller.signal)
+  } finally {
+    if (activeBookBreakdownControllers.get(requestKey) === controller) {
+      activeBookBreakdownControllers.delete(requestKey)
+    }
+  }
+})
+
+ipcMain.handle("book-breakdown:summarize-style", async (event, input) => {
+  const requestId = String(input?.requestId || "")
+  const projectPath = String(input?.projectPath || "")
+  if (!requestId) throw new Error("文风总结请求 ID 无效")
+  const requestKey = `${event.sender.id}:${requestId}`
+  const controller = new AbortController()
+  activeBookBreakdownControllers.set(requestKey, controller)
+  try {
+    return await requestBookBreakdownStyle(
+      projectPath,
+      input?.chapterLimit,
+      (progress) => {
+        if (event.sender.isDestroyed()) return
+        event.sender.send("book-breakdown:progress", {
+          requestId,
+          ...progress,
+        })
+      },
+      controller.signal,
+    )
   } finally {
     if (activeBookBreakdownControllers.get(requestKey) === controller) {
       activeBookBreakdownControllers.delete(requestKey)
@@ -5489,21 +6179,27 @@ ipcMain.handle("project:get-chapter", async (_event, projectPath, chapterName) =
   return requestService(`/api/project/chapter?${params}`)
 })
 
-ipcMain.handle("project:save-chapter", async (_event, projectPath, chapterName, content) => {
-  if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) {
-    throw new Error("作品目录不在当前小说库中")
-  }
-  return requestService("/api/project/chapter", {
-    method: "POST",
-    headers: { "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify({
-      root: getLibraryRoot(),
-      projectPath: path.resolve(projectPath),
-      chapterName,
-      content,
-    }),
-  })
-})
+ipcMain.handle("project:save-chapter", (_event, projectPath, chapterName, content) => (
+  saveChapterWithHistory(projectPath, chapterName, content)
+))
+
+ipcMain.handle("project:list-chapter-history", (_event, projectPath, chapterName) => (
+  listChapterHistory(projectPath, chapterName)
+))
+
+ipcMain.handle(
+  "project:get-chapter-history",
+  (_event, projectPath, chapterName, historyId) => (
+    readChapterHistoryEntry(projectPath, chapterName, historyId)
+  ),
+)
+
+ipcMain.handle(
+  "project:restore-chapter-history",
+  (_event, projectPath, chapterName, historyId) => (
+    restoreChapterHistory(projectPath, chapterName, historyId)
+  ),
+)
 
 ipcMain.handle("project:create-chapter", async (_event, projectPath, chapterName) => {
   if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) {

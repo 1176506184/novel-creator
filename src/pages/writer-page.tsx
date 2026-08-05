@@ -8,7 +8,6 @@ import {
 } from "react"
 import {
   ArrowLeft,
-  BookMarked,
   BookOpenCheck,
   BookOpenText,
   Bot,
@@ -42,7 +41,7 @@ import {
 import { AiMemoryDialog } from "@/components/ai-memory-dialog"
 import { BookBreakdownDialog } from "@/components/book-breakdown-dialog"
 import { CharacterSettingsDialog } from "@/components/character-settings-dialog"
-import { ReferenceStyleDialog } from "@/components/reference-style-dialog"
+import { ChapterHistoryDialog } from "@/components/chapter-history-dialog"
 import { Button } from "@/components/ui/button"
 import { WritingRulesDialog } from "@/components/writing-rules-dialog"
 import type {
@@ -370,12 +369,12 @@ export function WriterPage({
   const [isCreatingChapter, setIsCreatingChapter] = useState(false)
   const [deletingChapterName, setDeletingChapterName] = useState("")
   const [chapterContextMenu, setChapterContextMenu] = useState<ChapterContextMenu | null>(null)
+  const [historyChapter, setHistoryChapter] = useState<ChapterSummary | null>(null)
   const [newChapterName, setNewChapterName] = useState("")
   const [newChapterError, setNewChapterError] = useState("")
   const [isAiMemoryDialogOpen, setIsAiMemoryDialogOpen] = useState(false)
   const [isCharacterDialogOpen, setIsCharacterDialogOpen] = useState(false)
   const [isWritingRulesDialogOpen, setIsWritingRulesDialogOpen] = useState(false)
-  const [isReferenceStyleDialogOpen, setIsReferenceStyleDialogOpen] = useState(false)
   const [isBookBreakdownDialogOpen, setIsBookBreakdownDialogOpen] = useState(false)
   const [isAiPanelOpen, setIsAiPanelOpen] = useState(true)
   const [aiMessages, setAiMessages] = useState<AiMessage[]>([])
@@ -416,6 +415,7 @@ export function WriterPage({
   const activeGitSyncRequestIdRef = useRef("")
   const gitSyncResetTimerRef = useRef<number | null>(null)
   const isDirtyRef = useRef(false)
+  const autoConfirmAiChangesRef = useRef(false)
 
   const isDirty = Boolean(document) && content !== document.content
   isDirtyRef.current = isDirty
@@ -488,6 +488,75 @@ export function WriterPage({
     return () => {
       isCurrent = false
       window.removeEventListener("author-desk:api-settings-changed", handleApiSettingsChanged)
+    }
+  }, [])
+
+  useEffect(() => {
+    function handleForceReleaseWorkspace() {
+      chapterRequestId.current += 1
+      activeAiRequestIdRef.current = ""
+      activeAiMessageIdRef.current = ""
+
+      setIsLoadingChapters(false)
+      setIsLoadingDocument(false)
+      setIsSaving(false)
+      setIsCreatingChapter(false)
+      setDeletingChapterName("")
+      setActiveAiChangeSetId("")
+      setActiveAiChangeAction("")
+      setIsAiHistoryLoading(false)
+      setIsAiCompacting(false)
+      setIsAiThinking(false)
+      setIsAiStopping(false)
+      setAiError("")
+      setAiNotice("已强制解除临时占用状态；未完成的 AI 任务已停止，待发送内容仍保留。")
+      setIsAiQueuePaused(true)
+
+      updateAiQueuedPrompts((current) => current.map((prompt) => (
+        prompt.status === "guiding"
+          ? { ...prompt, status: "waiting" as const, requestId: undefined }
+          : prompt
+      )))
+      const releasedMessages = aiMessagesRef.current.map((message) => (
+        message.isStreaming
+          ? {
+              ...message,
+              content: message.content.trim() ? message.content : "任务已强制停止，可以继续发起新的请求。",
+              isStreaming: false,
+              status: "已强制解除占用",
+              hasError: false,
+            }
+          : message
+      ))
+      updateAiMessages(releasedMessages)
+      if (project) {
+        window.authorDesk.ai.saveHistory(project.path, releasedMessages).catch(() => {})
+      }
+    }
+
+    window.addEventListener("author-desk:force-release-workspace", handleForceReleaseWorkspace)
+    return () => {
+      window.removeEventListener("author-desk:force-release-workspace", handleForceReleaseWorkspace)
+    }
+  }, [project, updateAiMessages, updateAiQueuedPrompts])
+
+  useEffect(() => {
+    let isCurrent = true
+    function applyAiPreferences(preferences: { autoConfirmChanges: boolean }) {
+      if (!isCurrent) return
+      autoConfirmAiChangesRef.current = preferences.autoConfirmChanges === true
+    }
+    function handleAiPreferencesChanged(event: Event) {
+      const preferences = (event as CustomEvent<{ autoConfirmChanges: boolean }>).detail
+      if (preferences) applyAiPreferences(preferences)
+    }
+    window.addEventListener("author-desk:ai-preferences-changed", handleAiPreferencesChanged)
+    window.authorDesk.settings.getAiPreferences()
+      .then(applyAiPreferences)
+      .catch(() => applyAiPreferences({ autoConfirmChanges: false }))
+    return () => {
+      isCurrent = false
+      window.removeEventListener("author-desk:ai-preferences-changed", handleAiPreferencesChanged)
     }
   }, [])
 
@@ -682,10 +751,10 @@ export function WriterPage({
     setNewChapterError("")
     setDeletingChapterName("")
     setChapterContextMenu(null)
+    setHistoryChapter(null)
     setIsAiMemoryDialogOpen(false)
     setIsCharacterDialogOpen(false)
     setIsWritingRulesDialogOpen(false)
-    setIsReferenceStyleDialogOpen(false)
     setIsBookBreakdownDialogOpen(false)
     updateAiMessages([])
     setAiChatSummary("")
@@ -983,6 +1052,30 @@ export function WriterPage({
     }
   }
 
+  function openChapterHistory(chapter: ChapterSummary) {
+    setChapterContextMenu(null)
+    setHistoryChapter(chapter)
+  }
+
+  function handleChapterHistoryRestored(restoredDocument: ChapterDocument) {
+    setChapters((current) => current.map((chapter) => (
+      chapter.name === restoredDocument.name
+        ? {
+            name: restoredDocument.name,
+            path: restoredDocument.path,
+            characterCount: restoredDocument.characterCount,
+            modifiedAt: restoredDocument.modifiedAt,
+          }
+        : chapter
+    )))
+    if (restoredDocument.name === activeChapterName) {
+      chapterRequestId.current += 1
+      setDocument(restoredDocument)
+      setContent(restoredDocument.content)
+    }
+    onSaved()
+  }
+
   async function refreshAfterAiTools(toolEvents: AiToolEvent[]) {
     if (!project || !toolEvents.some((event) => ["created", "modified"].includes(event.kind))) return
     const chapterList = await window.authorDesk.project.getChapters(project.path)
@@ -1001,10 +1094,12 @@ export function WriterPage({
     onSaved()
   }
 
-  async function savePendingAiChanges(message: AiMessage) {
+  async function savePendingAiChanges(message: AiMessage, automatic = false) {
     if (!project || !message.changeSetId || message.changeStatus !== "pending") return
-    if (isDirty) {
-      setAiError("请先保存当前编辑器中的正文，再保存 AI 修改。")
+    if (isDirtyRef.current) {
+      setAiError(automatic
+        ? "检测到编辑器中有未保存正文，本次自动确认已暂停，请保存正文后手动处理 AI 修改。"
+        : "请先保存当前编辑器中的正文，再保存 AI 修改。")
       return
     }
     setActiveAiChangeSetId(message.changeSetId)
@@ -1054,9 +1149,11 @@ export function WriterPage({
       }
     })
     updateAiMessages(nextMessages)
+    let didPersistResolvedHistory = true
     try {
       await window.authorDesk.ai.saveHistory(project.path, nextMessages)
     } catch {
+      didPersistResolvedHistory = false
       setAiNotice("文件已保存，但对话状态暂时未能写入；下次打开时会自动恢复，不会重复修改文件。")
     }
     try {
@@ -1068,6 +1165,9 @@ export function WriterPage({
     } finally {
       setActiveAiChangeSetId("")
       setActiveAiChangeAction("")
+    }
+    if (automatic && didPersistResolvedHistory) {
+      setAiNotice(`已按设置自动确认并保存 ${result.appliedCount} 项修改。`)
     }
   }
 
@@ -1251,23 +1351,24 @@ export function WriterPage({
             ? { ...promptItem, status: "waiting" as const, requestId: undefined }
             : promptItem
         )))
+      const completedAssistantMessage: AiMessage = {
+        id: assistantMessageId,
+        role: "assistant",
+        content: response.content,
+        toolEvents: response.toolEvents,
+        status: response.changeSetId
+          ? `等待确认 ${response.pendingChangeCount} 项修改`
+          : response.autoReviewed
+            ? "已自动审核并收束"
+            : undefined,
+        changeSetId: response.changeSetId || undefined,
+        changeStatus: response.changeSetId ? "pending" : undefined,
+        diagnostics: response.diagnostics,
+      }
       const completedMessages: AiMessage[] = [
         ...nextMessages,
         ...steeringMessages,
-        {
-          id: assistantMessageId,
-          role: "assistant",
-          content: response.content,
-          toolEvents: response.toolEvents,
-          status: response.changeSetId
-            ? `等待确认 ${response.pendingChangeCount} 项修改`
-            : response.autoReviewed
-              ? "已自动审核并收束"
-              : undefined,
-          changeSetId: response.changeSetId || undefined,
-          changeStatus: response.changeSetId ? "pending" : undefined,
-          diagnostics: response.diagnostics,
-        },
+        completedAssistantMessage,
       ]
       updateAiMessages(completedMessages)
       if (activeAiRequestIdRef.current === requestId) {
@@ -1283,6 +1384,13 @@ export function WriterPage({
         setAiError(historyError instanceof Error
           ? historyError.message
           : "AI 回复已完成，但对话历史保存失败")
+      }
+      if (response.changeSetId && autoConfirmAiChangesRef.current) {
+        if (isDirtyRef.current) {
+          setAiNotice("编辑器中出现了未保存正文，已暂停自动确认；这组 AI 修改仍可手动保存或取消。")
+        } else {
+          await savePendingAiChanges(completedAssistantMessage, true)
+        }
       }
       try {
         const compacted = await window.authorDesk.ai.compactHistory(project.path)
@@ -1564,16 +1672,6 @@ export function WriterPage({
           </Button>
           <Button
             variant="ghost"
-            className={isReferenceStyleDialogOpen ? "bg-secondary text-primary hover:bg-secondary" : ""}
-            aria-haspopup="dialog"
-            aria-expanded={isReferenceStyleDialogOpen}
-            onClick={() => setIsReferenceStyleDialogOpen(true)}
-          >
-            <BookMarked className="size-4" />
-            参考文风
-          </Button>
-          <Button
-            variant="ghost"
             className={isBookBreakdownDialogOpen ? "bg-secondary text-primary hover:bg-secondary" : ""}
             aria-haspopup="dialog"
             aria-expanded={isBookBreakdownDialogOpen}
@@ -1720,7 +1818,7 @@ export function WriterPage({
                             setChapterContextMenu({
                               chapter,
                               x: Math.min(event.clientX, window.innerWidth - 196),
-                              y: Math.min(event.clientY, window.innerHeight - 116),
+                              y: Math.min(event.clientY, window.innerHeight - 164),
                             })
                           }}
                           onKeyDown={(event) => {
@@ -1730,7 +1828,7 @@ export function WriterPage({
                             setChapterContextMenu({
                               chapter,
                               x: Math.min(bounds.left + 32, window.innerWidth - 196),
-                              y: Math.min(bounds.top + 28, window.innerHeight - 116),
+                              y: Math.min(bounds.top + 28, window.innerHeight - 164),
                             })
                           }}
                           aria-haspopup="menu"
@@ -2251,6 +2349,15 @@ export function WriterPage({
             <button
               type="button"
               role="menuitem"
+              className="mt-1 flex h-9 w-full items-center gap-2 rounded-lg px-2.5 text-left text-xs font-medium text-foreground transition-colors hover:bg-muted"
+              onClick={() => openChapterHistory(chapterContextMenu.chapter)}
+            >
+              <Clock3 className="size-3.5 text-primary" />
+              查看历史记录
+            </button>
+            <button
+              type="button"
+              role="menuitem"
               disabled={Boolean(deletingChapterName)}
               className="mt-1 flex h-9 w-full items-center gap-2 rounded-lg px-2.5 text-left text-xs font-medium text-destructive transition-colors hover:bg-red-50 disabled:cursor-wait disabled:opacity-50"
               onClick={() => deleteChapter(chapterContextMenu.chapter)}
@@ -2396,17 +2503,22 @@ export function WriterPage({
         onClose={() => setIsWritingRulesDialogOpen(false)}
       />
 
-      <ReferenceStyleDialog
-        open={isReferenceStyleDialogOpen}
-        project={project}
-        onClose={() => setIsReferenceStyleDialogOpen(false)}
-      />
-
       <BookBreakdownDialog
         open={isBookBreakdownDialogOpen}
         project={project}
         onClose={() => setIsBookBreakdownDialogOpen(false)}
       />
+
+      {historyChapter && (
+        <ChapterHistoryDialog
+          open
+          project={project}
+          chapter={historyChapter}
+          canRestore={historyChapter.name !== activeChapterName || !isDirty}
+          onClose={() => setHistoryChapter(null)}
+          onRestored={handleChapterHistoryRestored}
+        />
+      )}
     </div>
   )
 }

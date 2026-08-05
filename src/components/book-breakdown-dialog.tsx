@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import {
   BookOpenCheck,
+  CheckCircle2,
   CircleAlert,
   Clock3,
   FileText,
@@ -14,6 +15,7 @@ import {
   Square,
   Upload,
   UsersRound,
+  WandSparkles,
   X,
 } from "lucide-react"
 
@@ -22,6 +24,7 @@ import type {
   BookBreakdownProgress,
   BookBreakdownState,
   LibraryProject,
+  ReferenceStyleProfile,
 } from "@/types/library"
 
 type BookBreakdownDialogProps = {
@@ -61,6 +64,22 @@ function formatError(error: unknown) {
     || "拆书操作失败"
 }
 
+const styleProfileSections: Array<{
+  key: keyof ReferenceStyleProfile
+  title: string
+  description: string
+}> = [
+  { key: "narrative", title: "叙事方式", description: "信息释放与叙述距离" },
+  { key: "viewpoint", title: "视角控制", description: "人称、焦点与切换规律" },
+  { key: "pacing", title: "剧情节奏", description: "冲突、悬念与推进速度" },
+  { key: "sentence", title: "句式段落", description: "语言密度与长短变化" },
+  { key: "dialogue", title: "人物对话", description: "对白比例与潜台词" },
+  { key: "description", title: "描写习惯", description: "动作、环境、心理与感官" },
+  { key: "emotion", title: "情绪表达", description: "情绪强度与递进方式" },
+  { key: "vocabulary", title: "用词语气", description: "词汇、修辞与整体语感" },
+  { key: "chapterStructure", title: "章节结构", description: "开头、中段与结尾组织" },
+]
+
 export function BookBreakdownDialog({
   open,
   project,
@@ -72,12 +91,15 @@ export function BookBreakdownDialog({
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [isStopping, setIsStopping] = useState(false)
   const [progress, setProgress] = useState<BookBreakdownProgress | null>(null)
+  const [activeView, setActiveView] = useState<"story" | "style">("story")
+  const [chapterLimit, setChapterLimit] = useState(0)
   const [error, setError] = useState("")
   const activeRequestIdRef = useRef("")
 
   useEffect(() => window.authorDesk.bookBreakdown.onProgress((nextProgress) => {
     if (!nextProgress.requestId || nextProgress.requestId !== activeRequestIdRef.current) return
     setProgress(nextProgress)
+    if (nextProgress.phase === "style") setActiveView("style")
   }), [])
 
   useEffect(() => {
@@ -87,7 +109,9 @@ export function BookBreakdownDialog({
     setError("")
     window.authorDesk.bookBreakdown.get(project.path)
       .then((nextState) => {
-        if (isCurrent) setState(nextState)
+        if (!isCurrent) return
+        setState(nextState)
+        setChapterLimit(nextState.selectedChapterCount || nextState.detectedChapterCount || 0)
       })
       .catch((loadError) => {
         if (isCurrent) setError(formatError(loadError))
@@ -111,7 +135,7 @@ export function BookBreakdownDialog({
 
   async function chooseSource() {
     if (
-      state?.report
+      (state?.report || state?.styleProfile)
       && !window.confirm("重新导入 TXT 会清除当前拆书结果，确定继续吗？")
     ) return
     setIsChoosing(true)
@@ -119,6 +143,8 @@ export function BookBreakdownDialog({
     try {
       const nextState = await window.authorDesk.bookBreakdown.chooseSource(project.path)
       setState(nextState)
+      setChapterLimit(nextState.selectedChapterCount || nextState.detectedChapterCount || 0)
+      setActiveView("story")
       setProgress(null)
     } catch (chooseError) {
       setError(formatError(chooseError))
@@ -145,8 +171,10 @@ export function BookBreakdownDialog({
       const nextState = await window.authorDesk.bookBreakdown.analyze({
         requestId,
         projectPath: project.path,
+        chapterLimit: state.detectedChapterCount ? chapterLimit : undefined,
       })
       setState(nextState)
+      setChapterLimit(nextState.selectedChapterCount || nextState.detectedChapterCount || 0)
     } catch (analysisError) {
       const message = formatError(analysisError)
       if (/AI_REQUEST_CANCELED|AI 请求已由用户停止/i.test(message)) {
@@ -154,6 +182,49 @@ export function BookBreakdownDialog({
         setProgress((current) => current
           ? { ...current, label: "已停止，分段进度已保留" }
           : null)
+        window.authorDesk.bookBreakdown.get(project.path)
+          .then((nextState) => {
+            setState(nextState)
+            setChapterLimit(nextState.selectedChapterCount || nextState.detectedChapterCount || 0)
+          })
+          .catch(() => {})
+      } else {
+        setError(message)
+      }
+    } finally {
+      if (activeRequestIdRef.current === requestId) activeRequestIdRef.current = ""
+      setIsAnalyzing(false)
+      setIsStopping(false)
+    }
+  }
+
+  async function summarizeStyle() {
+    if (!state?.sourcePath || isAnalyzing) return
+    const requestId = `breakdown-style-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    activeRequestIdRef.current = requestId
+    setIsAnalyzing(true)
+    setIsStopping(false)
+    setError("")
+    setActiveView("style")
+    setProgress({
+      requestId,
+      phase: "style",
+      label: "正在准备文风总结…",
+      completed: 0,
+      total: 1,
+    })
+    try {
+      const nextState = await window.authorDesk.bookBreakdown.summarizeStyle({
+        requestId,
+        projectPath: project.path,
+        chapterLimit: state.selectedChapterCount || chapterLimit || undefined,
+      })
+      setState(nextState)
+    } catch (styleError) {
+      const message = formatError(styleError)
+      if (/AI_REQUEST_CANCELED|AI 请求已由用户停止/i.test(message)) {
+        setError("")
+        setProgress((current) => current ? { ...current, label: "已停止文风总结" } : null)
       } else {
         setError(message)
       }
@@ -184,6 +255,7 @@ export function BookBreakdownDialog({
   if (!open) return null
 
   const report = state?.report
+  const styleProfile = state?.styleProfile
 
   return (
     <div
@@ -208,7 +280,7 @@ export function BookBreakdownDialog({
               <span className="ml-2 font-normal text-muted-foreground">· {project.name}</span>
             </h2>
             <p className="mt-1 truncate text-xs text-muted-foreground">
-              从本地 TXT 提取故事阶段、情节转折和可借鉴的高层机制
+              从本地 TXT 提取故事发展，并自动总结可复用的原创文风规律
             </p>
           </div>
           <div className="ml-auto flex shrink-0 items-center gap-2">
@@ -226,7 +298,11 @@ export function BookBreakdownDialog({
             ) : (
               <Button disabled={!state?.sourcePath || isLoading} onClick={analyze}>
                 {report ? <RefreshCw className="size-4" /> : <Sparkles className="size-4" />}
-                {report ? "重新拆解" : "开始拆书"}
+                {report
+                  ? chapterLimit !== state?.selectedChapterCount
+                    ? "按新范围拆解"
+                    : "重新拆解"
+                  : "开始拆书"}
               </Button>
             )}
             <Button
@@ -267,7 +343,7 @@ export function BookBreakdownDialog({
                 </div>
                 <h3 className="mt-5 text-lg font-semibold">导入一本本地 TXT 小说</h3>
                 <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                  文件会复制到当前作品的“参考小说/拆书”目录。AI 只提炼剧情结构，不会自动修改你的正文。
+                  文件会复制到当前作品的“参考小说/拆书”目录。AI 会提炼剧情结构与文风规律，不会自动修改你的正文。
                 </p>
                 <Button className="mt-6" onClick={chooseSource}>
                   <Upload className="size-4" />
@@ -297,6 +373,63 @@ export function BookBreakdownDialog({
                 )}
               </section>
 
+              <section className="rounded-xl border border-border bg-white px-5 py-4">
+                <div className="flex items-center gap-4">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-sm font-semibold">拆解范围</h3>
+                      {state.detectionMethod === "headings" ? (
+                        <span className="rounded-full bg-green-50 px-2 py-0.5 text-[10px] font-medium text-success">
+                          已识别 {state.detectedChapterCount} 章
+                        </span>
+                      ) : (
+                        <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                          未识别标准章节标题
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+                      {state.detectionMethod === "headings"
+                        ? `本次将分析开头连续章节；当前结果范围为${state.generatedAt ? `前 ${state.selectedChapterCount} 章` : "尚未生成"}。`
+                        : "将按全文长度自动切分片段；支持“第X章、第X回、序章、番外、Chapter X”等标题。"}
+                    </p>
+                    {state.chapterTitles.length > 0 && (
+                      <p className="mt-2 truncate text-[10px] text-muted-foreground" title={state.chapterTitles.join(" · ")}>
+                        识别示例：{state.chapterTitles.slice(0, 4).join(" · ")}
+                      </p>
+                    )}
+                  </div>
+
+                  {state.detectionMethod === "headings" && (
+                    <label className="flex shrink-0 items-center gap-2 rounded-xl bg-muted/35 px-3 py-2.5">
+                      <span className="text-xs font-medium">拆前</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={state.detectedChapterCount}
+                        value={chapterLimit || 1}
+                        disabled={isAnalyzing}
+                        onChange={(event) => {
+                          const nextValue = Math.floor(Number(event.target.value) || 1)
+                          setChapterLimit(Math.min(state.detectedChapterCount, Math.max(1, nextValue)))
+                        }}
+                        className="h-9 w-20 rounded-lg border border-input bg-white px-2 text-center text-sm font-semibold outline-none focus:border-primary/40 focus:ring-3 focus:ring-primary/10"
+                      />
+                      <span className="text-xs font-medium">章</span>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        disabled={isAnalyzing || chapterLimit === state.detectedChapterCount}
+                        onClick={() => setChapterLimit(state.detectedChapterCount)}
+                      >
+                        全部
+                      </Button>
+                    </label>
+                  )}
+                </div>
+              </section>
+
               {(isAnalyzing || progress) && (
                 <section className="rounded-xl border border-primary/15 bg-secondary/55 px-5 py-4">
                   <div className="flex items-center gap-3">
@@ -323,13 +456,141 @@ export function BookBreakdownDialog({
                 </section>
               )}
 
-              {!report ? (
+              {(report || styleProfile || state.styleError) && (
+                <div className="flex items-center gap-1 rounded-xl border border-border bg-white p-1.5">
+                  <button
+                    type="button"
+                    className={`flex h-9 flex-1 items-center justify-center gap-2 rounded-lg text-xs font-semibold transition-colors ${
+                      activeView === "story"
+                        ? "bg-secondary text-primary"
+                        : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                    }`}
+                    onClick={() => setActiveView("story")}
+                  >
+                    <Route className="size-3.5" />
+                    故事情节
+                  </button>
+                  <button
+                    type="button"
+                    className={`flex h-9 flex-1 items-center justify-center gap-2 rounded-lg text-xs font-semibold transition-colors ${
+                      activeView === "style"
+                        ? "bg-secondary text-primary"
+                        : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                    }`}
+                    onClick={() => setActiveView("style")}
+                  >
+                    <WandSparkles className="size-3.5" />
+                    参考文风
+                    {styleProfile && <CheckCircle2 className="size-3.5 text-success" />}
+                  </button>
+                </div>
+              )}
+
+              {activeView === "style" ? (
+                styleProfile ? (
+                  <div className="space-y-4">
+                    <section className="rounded-xl border border-primary/10 bg-gradient-to-br from-secondary/80 to-white p-5">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="size-4 text-primary" />
+                        <h3 className="text-sm font-semibold text-primary">整体风格画像</h3>
+                        <span className="ml-auto text-[10px] text-muted-foreground">
+                          {formatNumber(state.styleSampledCharacters)} 字样本 · {formatTime(state.styleGeneratedAt)}
+                        </span>
+                      </div>
+                      <p className="mt-3 text-sm leading-7 text-foreground/80">{styleProfile.overview}</p>
+                    </section>
+
+                    <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                      {styleProfileSections.map((section) => (
+                        <section key={section.key} className="rounded-xl border border-border bg-white p-4">
+                          <h4 className="text-sm font-semibold">{section.title}</h4>
+                          <p className="mt-1 text-[10px] text-muted-foreground">{section.description}</p>
+                          <p className="mt-3 text-xs leading-5 text-foreground/75">
+                            {String(styleProfile[section.key])}
+                          </p>
+                        </section>
+                      ))}
+                    </div>
+
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <section className="rounded-xl border border-border bg-white p-5">
+                        <h4 className="text-sm font-semibold">可借鉴技巧</h4>
+                        <div className="mt-3 space-y-2">
+                          {styleProfile.techniques.map((item) => (
+                            <div key={item} className="flex gap-2 text-xs leading-5 text-foreground/75">
+                              <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-success" />
+                              <span>{item}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </section>
+                      <section className="rounded-xl border border-border bg-white p-5">
+                        <h4 className="text-sm font-semibold">原创边界</h4>
+                        <div className="mt-3 space-y-2">
+                          {styleProfile.avoid.map((item) => (
+                            <div key={item} className="flex gap-2 text-xs leading-5 text-foreground/75">
+                              <X className="mt-0.5 size-3.5 shrink-0 text-destructive" />
+                              <span>{item}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </section>
+                    </div>
+
+                    <details className="rounded-xl border border-border bg-white">
+                      <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-semibold">
+                        <FileText className="size-4 text-primary" />
+                        查看注入 AI 的完整文风指令
+                        <span className="ml-auto text-[10px] font-normal text-success">已用于当前作品</span>
+                      </summary>
+                      <p className="select-text whitespace-pre-wrap border-t border-border px-4 py-4 text-xs leading-6 text-foreground/75">
+                        {styleProfile.writingPrompt}
+                      </p>
+                    </details>
+
+                    {!isAnalyzing && (
+                      <div className="flex justify-end">
+                        <Button variant="outline" onClick={summarizeStyle}>
+                          <RefreshCw className="size-4" />
+                          重新总结文风
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <section className="grid min-h-[420px] place-items-center rounded-xl border border-border bg-white p-8 text-center">
+                    <div className="max-w-md">
+                      {isAnalyzing ? (
+                        <LoaderCircle className="mx-auto size-8 animate-spin text-primary" />
+                      ) : (
+                        <WandSparkles className="mx-auto size-8 text-primary" />
+                      )}
+                      <h3 className="mt-4 text-base font-semibold">
+                        {isAnalyzing ? "正在自动总结文风" : "文风总结尚未完成"}
+                      </h3>
+                      <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                        {state.styleError
+                          ? `上次总结失败：${state.styleError}`
+                          : report
+                            ? "情节拆解已经保存，可以只重试文风总结，不需要重新拆书。"
+                            : "完成情节拆解后，会自动从同一批章节中均匀取样并生成文风规则。"}
+                      </p>
+                      {!isAnalyzing && report && (
+                        <Button className="mt-5" onClick={summarizeStyle}>
+                          <Sparkles className="size-4" />
+                          单独总结文风
+                        </Button>
+                      )}
+                    </div>
+                  </section>
+                )
+              ) : !report ? (
                 <section className="grid min-h-[420px] place-items-center rounded-xl border border-border bg-white">
                   <div className="max-w-md text-center">
                     <Route className="mx-auto size-9 text-primary" />
                     <h3 className="mt-4 text-base font-semibold">TXT 已准备好</h3>
                     <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                      拆解过程会覆盖全文，每完成一个片段都会立即保存。未完成片段可稍后单独补拆，也可以随时停止后继续。
+                      AI 会拆解所选章节的故事发展，随后自动总结同一范围的文风。每个片段都会保存进度，可以随时停止后继续。
                     </p>
                     {!isAnalyzing && (
                       <Button className="mt-5" onClick={analyze}>

@@ -1963,6 +1963,33 @@ svg {
   font-size: 13px;
 }
 
+.download-platforms {
+  display: grid;
+  min-width: 260px;
+  gap: 9px;
+}
+
+.download-platforms .button {
+  width: 100%;
+}
+
+.download-intel-link {
+  color: white;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+  text-decoration: underline;
+  text-decoration-color: rgba(255, 255, 255, 0.45);
+  text-underline-offset: 4px;
+}
+
+.download-platforms small {
+  color: #ffe0d5;
+  font-size: 10px;
+  line-height: 1.5;
+  text-align: center;
+}
+
 .site-footer {
   padding: 42px 0;
   border-top: 1px solid var(--line);
@@ -2146,7 +2173,7 @@ svg {
     grid-template-columns: auto 1fr;
   }
 
-  .download-card .button {
+  .download-card .download-platforms {
     grid-column: 1 / -1;
   }
 }
@@ -2504,6 +2531,11 @@ svg {
 
   .download-card img {
     margin-inline: auto;
+  }
+
+  .download-platforms {
+    width: 100%;
+    min-width: 0;
   }
 
   .footer-links {

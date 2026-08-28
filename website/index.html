@@ -102,14 +102,19 @@
               </a>
               <a
                 class="button button-secondary button-large"
-                href="https://github.com/1176506184/novel-creator"
-                target="_blank"
-                rel="noreferrer"
+                href="https://github.com/1176506184/novel-creator/releases/download/v0.1.7/novel-creator-0.1.7-mac-arm64.dmg"
+                data-mac-download-link="arm64"
               >
-                查看 GitHub
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M7 17 17 7M8 7h9v9" />
-                </svg>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16.7 13.1c0-2.5 2.1-3.7 2.2-3.8a4.8 4.8 0 0 0-3.8-2.1c-1.6-.2-3.1.9-3.9.9-.8 0-2-1-3.3-1-1.7 0-3.3 1-4.2 2.5-1.8 3.1-.5 7.7 1.3 10.2.9 1.2 1.9 2.6 3.3 2.5 1.3-.1 1.8-.8 3.4-.8 1.6 0 2 .8 3.4.8 1.4 0 2.3-1.2 3.1-2.5 1-1.4 1.4-2.8 1.4-2.9-.1 0-2.9-1.1-2.9-3.8ZM14 5.5a4.2 4.2 0 0 0 1-3 4.3 4.3 0 0 0-2.8 1.4 4 4 0 0 0-1 2.9A3.6 3.6 0 0 0 14 5.5Z" /></svg>
+                <span data-mac-download-label="arm64">Mac Apple 芯片</span>
+              </a>
+              <a
+                class="button button-secondary button-large"
+                href="https://github.com/1176506184/novel-creator/releases/download/v0.1.7/novel-creator-0.1.7-mac-x64.dmg"
+                data-mac-download-link="x64"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16.7 13.1c0-2.5 2.1-3.7 2.2-3.8a4.8 4.8 0 0 0-3.8-2.1c-1.6-.2-3.1.9-3.9.9-.8 0-2-1-3.3-1-1.7 0-3.3 1-4.2 2.5-1.8 3.1-.5 7.7 1.3 10.2.9 1.2 1.9 2.6 3.3 2.5 1.3-.1 1.8-.8 3.4-.8 1.6 0 2 .8 3.4.8 1.4 0 2.3-1.2 3.1-2.5 1-1.4 1.4-2.8 1.4-2.9-.1 0-2.9-1.1-2.9-3.8ZM14 5.5a4.2 4.2 0 0 0 1-3 4.3 4.3 0 0 0-2.8 1.4 4 4 0 0 0-1 2.9A3.6 3.6 0 0 0 14 5.5Z" /></svg>
+                <span data-mac-download-label="x64">Mac Intel</span>
               </a>
             </div>
             <div class="trust-row" aria-label="产品特性">
@@ -651,7 +656,11 @@
             </details>
             <details>
               <summary>电脑没有安装 Node.js 能运行吗？<span></span></summary>
-              <p>可以。Windows 安装包已经包含 Electron 和应用所需的 Node.js 运行环境，普通用户无需额外安装 Node.js。</p>
+              <p>可以。Windows 与 macOS 安装包都已经包含 Electron 和应用所需的 Node.js 运行环境，普通用户无需额外安装 Node.js。</p>
+            </details>
+            <details>
+              <summary>MacBook 应该下载哪个版本？<span></span></summary>
+              <p>M1、M2、M3、M4 等 Apple 芯片机型请选择 Apple Silicon；较早的 Intel 处理器机型请选择 Intel。当前 Mac 版本未签名，首次打开时请在 Finder 中右键应用并选择“打开”，再确认一次。</p>
             </details>
           </div>
         </div>
@@ -664,18 +673,21 @@
             <div>
               <div class="eyebrow">下一章，从这里开始</div>
               <h2>让工具记住设定，把注意力还给故事</h2>
-              <p data-download-meta>Windows x64 · v0.1.7 · 内置运行环境 · 无需安装 Node.js</p>
+              <p>Windows 与 macOS · v0.1.7 · 内置运行环境 · 无需安装 Node.js</p>
             </div>
-            <a
-              class="button button-light button-large"
-              href="https://github.com/1176506184/novel-creator/releases"
-              data-download-link
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14" />
-              </svg>
-              <span data-download-label>下载 Windows 版</span>
-            </a>
+            <div class="download-platforms">
+              <a class="button button-light button-large" href="https://github.com/1176506184/novel-creator/releases" data-download-link>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14" /></svg>
+                <span data-download-label>下载 Windows 版</span>
+              </a>
+              <a class="button button-light button-large" href="https://github.com/1176506184/novel-creator/releases/download/v0.1.7/novel-creator-0.1.7-mac-arm64.dmg" data-mac-download-link="arm64">
+                <span data-mac-download-label="arm64">Mac Apple Silicon</span>
+              </a>
+              <a class="download-intel-link" href="https://github.com/1176506184/novel-creator/releases/download/v0.1.7/novel-creator-0.1.7-mac-x64.dmg" data-mac-download-link="x64">
+                <span data-mac-download-label="x64">下载 Intel Mac 版</span>
+              </a>
+              <small>Mac 版未签名 · M1 及更新机型选择 Apple Silicon</small>
+            </div>
           </div>
         </div>
       </section>

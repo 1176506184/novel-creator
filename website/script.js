@@ -68,6 +68,8 @@ const updateReleaseLinks = async () => {
 
     const release = await response.json();
     const windowsAsset = release.assets?.find((asset) => /\.exe$/i.test(asset.name));
+    const macArmAsset = release.assets?.find((asset) => /mac-arm64\.dmg$/i.test(asset.name));
+    const macIntelAsset = release.assets?.find((asset) => /mac-x64\.dmg$/i.test(asset.name));
     const href = windowsAsset?.browser_download_url || release.html_url || releaseUrl;
     const version = release.tag_name?.replace(/^v/i, "");
 
@@ -79,12 +81,26 @@ const updateReleaseLinks = async () => {
       link.href = release.html_url || releaseUrl;
     });
 
+    document.querySelectorAll('[data-mac-download-link="arm64"]').forEach((link) => {
+      link.href = macArmAsset?.browser_download_url || release.html_url || releaseUrl;
+    });
+
+    document.querySelectorAll('[data-mac-download-link="x64"]').forEach((link) => {
+      link.href = macIntelAsset?.browser_download_url || release.html_url || releaseUrl;
+    });
+
     if (version) {
       document.querySelectorAll("[data-download-label]").forEach((label) => {
         label.textContent = `下载 Windows 版 v${version}`;
       });
       document.querySelectorAll("[data-version-label]").forEach((label) => {
         label.textContent = `v${version}`;
+      });
+      document.querySelectorAll('[data-mac-download-label="arm64"]').forEach((label) => {
+        label.textContent = `Mac Apple Silicon v${version}`;
+      });
+      document.querySelectorAll('[data-mac-download-label="x64"]').forEach((label) => {
+        label.textContent = `Mac Intel v${version}`;
       });
     }
 

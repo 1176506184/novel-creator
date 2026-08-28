@@ -1,5 +1,6 @@
 const path = require("node:path")
 const fs = require("node:fs")
+const os = require("node:os")
 const { createHash, randomUUID } = require("node:crypto")
 const { spawn } = require("node:child_process")
 const git = require("isomorphic-git")
@@ -28,7 +29,11 @@ const ICON_TRAY_PATH = path.join(__dirname, "..", "assets", "app-icon-32.png")
 const ICON_ICO_PATH = path.join(__dirname, "..", "assets", "app-icon.ico")
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL
 const SHOULD_OPEN_DEVTOOLS = process.env.AUTHOR_DESK_DEVTOOLS === "1"
-const DEFAULT_LIBRARY_ROOT = process.env.AUTHOR_DESK_LIBRARY_ROOT || String.raw`G:\小说库`
+const DEFAULT_LIBRARY_ROOT = process.env.AUTHOR_DESK_LIBRARY_ROOT || (
+  process.platform === "win32"
+    ? String.raw`G:\小说库`
+    : path.join(os.homedir(), "Documents", "小说库")
+)
 const DEFAULT_API_CONFIG = {
   baseUrl: "https://ai98pro.xyz/v1",
   model: "gpt-5.6-sol",

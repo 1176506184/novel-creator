@@ -14,6 +14,7 @@
     "pack": "yarn build && electron-builder --dir",
     "dist:win": "yarn build && electron-builder --win nsis",
     "dist:portable": "yarn build && electron-builder --win portable",
+    "dist:mac": "yarn build && electron-builder --mac dmg zip",
     "start": "yarn dev"
   },
   "dependencies": {
@@ -68,6 +69,30 @@
           ]
         }
       ]
+    },
+    "mac": {
+      "icon": "assets/app-icon-source.png",
+      "category": "public.app-category.productivity",
+      "identity": null,
+      "hardenedRuntime": false,
+      "notarize": false,
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "artifactName": "novel-creator-${version}-mac-${arch}.${ext}"
     },
     "nsis": {
       "oneClick": false,

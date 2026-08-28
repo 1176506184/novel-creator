@@ -39,13 +39,26 @@ yarn dist:win
 yarn dist:portable
 ```
 
+在 macOS 上生成未签名的 Intel 与 Apple Silicon 安装包：
+
+```bash
+yarn dist:mac
+```
+
+Windows 无法完成可靠的 macOS 本地打包，因此仓库提供
+`Build unsigned macOS release` GitHub Actions 工作流。它会在 GitHub 的
+macOS 云端机器上分别生成 x64 与 arm64 的 DMG/ZIP，并上传到对应 Release。
+未签名版本首次打开时会触发 macOS 的安全提示。
+
 打包结果统一输出到 `release` 目录：
 
 ```text
 release\
 ├─ win-unpacked\
 ├─ 作者管家-0.1.7-安装包.exe
-└─ 作者管家-0.1.7-便携版.exe
+├─ 作者管家-0.1.7-便携版.exe
+├─ novel-creator-0.1.7-mac-x64.dmg
+└─ novel-creator-0.1.7-mac-arm64.dmg
 ```
 
 当前关闭了 ASAR，以保证内置 `electron/server.cjs` Node 服务可以从普通磁盘路径

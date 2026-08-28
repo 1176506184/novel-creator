@@ -1407,6 +1407,15 @@ const AI_CHAT_DUPLICATE_TOOL_LIMIT = 3
 const activeAiChatSessions = new Map()
 const activeBookBreakdownControllers = new Map()
 const activeNovelIntroductionControllers = new Map()
+const SCHEDULED_TASK_STORE_FILE = "scheduled-tasks.json"
+const SCHEDULED_TASK_RUN_LIMIT = 40
+const SCHEDULED_TASK_CATCH_UP_MS = 36 * 60 * 60 * 1000
+const SCHEDULED_TASK_CHECK_INTERVAL_MS = 60 * 1000
+const activeScheduledTaskRuns = new Map()
+const writerWorkspaceStates = new Map()
+let scheduledTaskCheckTimer = null
+let scheduledTaskStartupTimer = null
+let isCheckingScheduledTasks = false
 
 function getAiWrapUpReasoningEffort(reasoningEffort) {
   return ["high", "xhigh", "max", "ultra"].includes(reasoningEffort)
@@ -2209,6 +2218,549 @@ async function requestAiChat(input, onProgress = () => {}, signal, steeringSessi
   return finalizeWithAutomaticReview(
     `已达到 ${AI_CHAT_TOOL_ROUND_LIMIT} 轮工具调用上限`,
   )
+}
+
+function getScheduledTaskStorePath(projectPath) {
+  if (typeof projectPath !== "string" || !isPathInsideLibrary(projectPath)) {
+    throw new Error("作品目录不在当前小说库中")
+  }
+  return path.join(path.resolve(projectPath), ".chat", SCHEDULED_TASK_STORE_FILE)
+}
+
+function normalizeScheduledTaskTime(value) {
+  const time = String(value || "").trim()
+  const match = time.match(/^(\d{2}):(\d{2})$/)
+  if (!match) throw new Error("执行时间格式无效")
+  const hour = Number(match[1])
+  const minute = Number(match[2])
+  if (hour > 23 || minute > 59) throw new Error("执行时间无效")
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`
+}
+
+function normalizeScheduledTaskWeekdays(value, scheduleType) {
+  if (scheduleType === "daily") return []
+  const weekdays = [...new Set(
+    (Array.isArray(value) ? value : [])
+      .map((item) => Math.floor(Number(item)))
+      .filter((item) => item >= 1 && item <= 7),
+  )].sort((left, right) => left - right)
+  if (!weekdays.length) throw new Error("请至少选择一个执行星期")
+  return weekdays
+}
+
+function normalizeScheduledTask(task, index = 0) {
+  if (!task || typeof task !== "object") return null
+  const scheduleType = task.scheduleType === "daily" ? "daily" : "weekly"
+  let time
+  let weekdays
+  try {
+    time = normalizeScheduledTaskTime(task.time)
+    weekdays = normalizeScheduledTaskWeekdays(task.weekdays, scheduleType)
+  } catch {
+    return null
+  }
+  const name = String(task.name || "").trim().slice(0, 100)
+  const instruction = String(task.instruction || "").trim().slice(0, 20_000)
+  if (!name || !instruction) return null
+  const status = ["idle", "running", "success", "failed", "pending-confirmation"].includes(task.status)
+    ? task.status
+    : "idle"
+  return {
+    id: /^[a-f0-9-]{36}$/i.test(String(task.id || ""))
+      ? String(task.id)
+      : `invalid-${Date.now()}-${index}`,
+    name,
+    instruction,
+    scheduleType,
+    time,
+    weekdays,
+    enabled: task.enabled !== false,
+    autoApplyChanges: task.autoApplyChanges !== false,
+    presetKey: String(task.presetKey || "").slice(0, 100),
+    createdAt: typeof task.createdAt === "string" ? task.createdAt : new Date().toISOString(),
+    updatedAt: typeof task.updatedAt === "string" ? task.updatedAt : new Date().toISOString(),
+    lastRunAt: typeof task.lastRunAt === "string" ? task.lastRunAt : null,
+    lastScheduledAt: typeof task.lastScheduledAt === "string" ? task.lastScheduledAt : null,
+    status,
+    lastResult: String(task.lastResult || "").slice(0, 8_000),
+    lastError: String(task.lastError || "").slice(0, 4_000),
+  }
+}
+
+function normalizeScheduledTaskRun(run, index = 0) {
+  if (!run || typeof run !== "object") return null
+  const status = ["success", "failed", "pending-confirmation"].includes(run.status)
+    ? run.status
+    : "failed"
+  return {
+    id: String(run.id || `run-${Date.now()}-${index}`).slice(0, 300),
+    taskId: String(run.taskId || "").slice(0, 300),
+    taskName: String(run.taskName || "定时任务").slice(0, 100),
+    scheduledAt: typeof run.scheduledAt === "string" ? run.scheduledAt : null,
+    startedAt: typeof run.startedAt === "string" ? run.startedAt : null,
+    finishedAt: typeof run.finishedAt === "string" ? run.finishedAt : null,
+    status,
+    result: String(run.result || "").slice(0, 8_000),
+    error: String(run.error || "").slice(0, 4_000),
+    appliedCount: Math.max(0, Math.floor(Number(run.appliedCount) || 0)),
+  }
+}
+
+async function readScheduledTaskStore(projectPath) {
+  const storePath = getScheduledTaskStorePath(projectPath)
+  try {
+    const data = JSON.parse(await fs.promises.readFile(storePath, "utf8"))
+    return {
+      tasks: (Array.isArray(data?.tasks) ? data.tasks : [])
+        .map(normalizeScheduledTask)
+        .filter(Boolean),
+      runs: (Array.isArray(data?.runs) ? data.runs : [])
+        .map(normalizeScheduledTaskRun)
+        .filter(Boolean)
+        .slice(0, SCHEDULED_TASK_RUN_LIMIT),
+    }
+  } catch (error) {
+    if (error?.code === "ENOENT") return { tasks: [], runs: [] }
+    throw new Error(`无法读取定时任务：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+async function writeScheduledTaskStore(projectPath, store) {
+  const storePath = getScheduledTaskStorePath(projectPath)
+  const normalizedStore = {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    tasks: (Array.isArray(store?.tasks) ? store.tasks : [])
+      .map(normalizeScheduledTask)
+      .filter(Boolean),
+    runs: (Array.isArray(store?.runs) ? store.runs : [])
+      .map(normalizeScheduledTaskRun)
+      .filter(Boolean)
+      .slice(0, SCHEDULED_TASK_RUN_LIMIT),
+  }
+  await fs.promises.mkdir(path.dirname(storePath), { recursive: true })
+  await fs.promises.writeFile(storePath, `${JSON.stringify(normalizedStore, null, 2)}\n`, "utf8")
+  return normalizedStore
+}
+
+function scheduledTaskMatchesDate(task, date) {
+  if (task.scheduleType === "daily") return true
+  const weekday = date.getDay() === 0 ? 7 : date.getDay()
+  return task.weekdays.includes(weekday)
+}
+
+function createScheduledTaskDate(sourceDate, time) {
+  const [hour, minute] = time.split(":").map(Number)
+  const date = new Date(sourceDate)
+  date.setHours(hour, minute, 0, 0)
+  return date
+}
+
+function getLatestScheduledTaskDate(task, now = new Date()) {
+  for (let offset = 0; offset <= 7; offset += 1) {
+    const day = new Date(now)
+    day.setDate(day.getDate() - offset)
+    const candidate = createScheduledTaskDate(day, task.time)
+    if (candidate <= now && scheduledTaskMatchesDate(task, candidate)) return candidate
+  }
+  return null
+}
+
+function getNextScheduledTaskDate(task, now = new Date()) {
+  for (let offset = 0; offset <= 8; offset += 1) {
+    const day = new Date(now)
+    day.setDate(day.getDate() + offset)
+    const candidate = createScheduledTaskDate(day, task.time)
+    if (candidate > now && scheduledTaskMatchesDate(task, candidate)) return candidate
+  }
+  return null
+}
+
+function serializeScheduledTaskStore(store) {
+  const now = new Date()
+  return {
+    ok: true,
+    tasks: store.tasks.map((task) => ({
+      ...task,
+      nextRunAt: task.enabled ? getNextScheduledTaskDate(task, now)?.toISOString() || null : null,
+      isRunning: activeScheduledTaskRuns.has(task.id),
+    })),
+    runs: store.runs,
+  }
+}
+
+async function getScheduledTasks(projectPath) {
+  return serializeScheduledTaskStore(await readScheduledTaskStore(projectPath))
+}
+
+function notifyScheduledTasksUpdated(projectPath) {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.webContents.send("scheduled-tasks:updated", {
+    projectPath: path.resolve(projectPath),
+  })
+}
+
+async function saveScheduledTask(projectPath, input) {
+  if (!input || typeof input !== "object") throw new Error("定时任务参数无效")
+  const store = await readScheduledTaskStore(projectPath)
+  const now = new Date().toISOString()
+  const taskId = String(input.id || "")
+  const currentIndex = store.tasks.findIndex((task) => task.id === taskId)
+  const previous = currentIndex >= 0 ? store.tasks[currentIndex] : null
+  const candidate = normalizeScheduledTask({
+    ...previous,
+    ...input,
+    id: previous?.id || randomUUID(),
+    createdAt: previous?.createdAt || now,
+    updatedAt: now,
+    status: previous?.status || "idle",
+    lastRunAt: previous?.lastRunAt || null,
+    lastScheduledAt: previous?.lastScheduledAt || null,
+    lastResult: previous?.lastResult || "",
+    lastError: previous?.lastError || "",
+  })
+  if (!candidate) throw new Error("请完整填写任务名称、指令、执行时间和星期")
+  if (currentIndex >= 0) store.tasks[currentIndex] = candidate
+  else store.tasks.unshift(candidate)
+  const saved = await writeScheduledTaskStore(projectPath, store)
+  notifyScheduledTasksUpdated(projectPath)
+  return serializeScheduledTaskStore(saved)
+}
+
+async function deleteScheduledTask(projectPath, taskIdInput) {
+  const taskId = String(taskIdInput || "")
+  if (activeScheduledTaskRuns.has(taskId)) throw new Error("任务正在执行，暂时不能删除")
+  const store = await readScheduledTaskStore(projectPath)
+  const nextTasks = store.tasks.filter((task) => task.id !== taskId)
+  if (nextTasks.length === store.tasks.length) throw new Error("定时任务不存在")
+  const saved = await writeScheduledTaskStore(projectPath, { ...store, tasks: nextTasks })
+  notifyScheduledTasksUpdated(projectPath)
+  return serializeScheduledTaskStore(saved)
+}
+
+async function setScheduledTaskEnabled(projectPath, taskIdInput, enabled) {
+  const taskId = String(taskIdInput || "")
+  const store = await readScheduledTaskStore(projectPath)
+  const task = store.tasks.find((item) => item.id === taskId)
+  if (!task) throw new Error("定时任务不存在")
+  task.enabled = enabled === true
+  task.updatedAt = new Date().toISOString()
+  task.status = "idle"
+  if (task.enabled) {
+    task.lastScheduledAt = getLatestScheduledTaskDate(task)?.toISOString() || task.lastScheduledAt
+  }
+  const saved = await writeScheduledTaskStore(projectPath, store)
+  notifyScheduledTasksUpdated(projectPath)
+  return serializeScheduledTaskStore(saved)
+}
+
+async function createWeeklyWritingPreset(projectPath, timeInput) {
+  const time = normalizeScheduledTaskTime(timeInput || "09:00")
+  const store = await readScheduledTaskStore(projectPath)
+  const now = new Date().toISOString()
+  const presets = [
+    {
+      presetKey: "weekly-writing-mon-thu",
+      name: "周一至周四 · 每天写 2 章",
+      weekdays: [1, 2, 3, 4],
+      instruction: [
+        "请继续创作当前小说，一次完成接下来的 2 个连续章节。",
+        "先读取正文目录、最近章节以及与本段剧情直接相关的内容，确认章节编号和承接关系。",
+        "每章都要有明确推进和自然收束，保持人物、设定、伏笔与现有写作规则一致。",
+        "请把两章分别创建为正文目录中的独立章节文件，不要只在对话里输出正文。",
+      ].join("\n"),
+    },
+    {
+      presetKey: "weekly-writing-friday",
+      name: "周五 · 集中写 6 章",
+      weekdays: [5],
+      instruction: [
+        "请继续创作当前小说，一次完成接下来的 6 个连续章节。",
+        "先读取正文目录、最近章节以及与本段剧情直接相关的内容，规划好六章的连续推进再动笔。",
+        "六章之间需要有清晰的情节递进，每章都要保持人物、设定、伏笔与现有写作规则一致。",
+        "请把六章分别创建为正文目录中的独立章节文件，不要只在对话里输出正文。",
+      ].join("\n"),
+    },
+  ]
+  for (const preset of presets) {
+    const existingIndex = store.tasks.findIndex((task) => task.presetKey === preset.presetKey)
+    const previous = existingIndex >= 0 ? store.tasks[existingIndex] : null
+    const task = normalizeScheduledTask({
+      ...previous,
+      ...preset,
+      id: previous?.id || randomUUID(),
+      scheduleType: "weekly",
+      time,
+      enabled: true,
+      autoApplyChanges: true,
+      createdAt: previous?.createdAt || now,
+      updatedAt: now,
+      status: previous?.status || "idle",
+    })
+    if (existingIndex >= 0) store.tasks[existingIndex] = task
+    else store.tasks.unshift(task)
+  }
+  const saved = await writeScheduledTaskStore(projectPath, store)
+  notifyScheduledTasksUpdated(projectPath)
+  return serializeScheduledTaskStore(saved)
+}
+
+function hasActiveAiSessionForProject(projectPath) {
+  const normalizedProjectPath = path.resolve(projectPath)
+  return [...activeAiChatSessions.values()].some((session) => (
+    session.projectPath && path.resolve(session.projectPath) === normalizedProjectPath
+  ))
+}
+
+function hasActiveScheduledTaskForProject(projectPath) {
+  const normalizedProjectPath = path.resolve(projectPath)
+  return [...activeScheduledTaskRuns.values()].some((run) => (
+    path.resolve(run.projectPath) === normalizedProjectPath
+  ))
+}
+
+function hasUnsavedWriterWorkspace(projectPath) {
+  const normalizedProjectPath = path.resolve(projectPath)
+  return [...writerWorkspaceStates.values()].some((state) => (
+    state.isDirty && state.projectPath && path.resolve(state.projectPath) === normalizedProjectPath
+  ))
+}
+
+async function executeScheduledTask(projectPath, taskIdInput, scheduledAtInput = null) {
+  const taskId = String(taskIdInput || "")
+  if (activeScheduledTaskRuns.has(taskId)) throw new Error("这个任务正在执行")
+  if (hasActiveAiSessionForProject(projectPath)) {
+    throw new Error("当前小说的 AI 助手正在运行，定时任务会稍后重试")
+  }
+  if (hasUnsavedWriterWorkspace(projectPath)) {
+    throw new Error("当前小说有未保存的正文，保存后定时任务会自动继续")
+  }
+  const controller = new AbortController()
+  activeScheduledTaskRuns.set(taskId, { controller, projectPath: path.resolve(projectPath) })
+  let store
+  let task
+  try {
+    store = await readScheduledTaskStore(projectPath)
+    task = store.tasks.find((item) => item.id === taskId)
+    if (!task) throw new Error("定时任务不存在")
+  } catch (error) {
+    activeScheduledTaskRuns.delete(taskId)
+    throw error
+  }
+
+  const startedAt = new Date().toISOString()
+  const scheduledAt = scheduledAtInput instanceof Date
+    ? scheduledAtInput.toISOString()
+    : typeof scheduledAtInput === "string" && scheduledAtInput
+      ? scheduledAtInput
+      : startedAt
+  task.status = "running"
+  task.lastError = ""
+  try {
+    await writeScheduledTaskStore(projectPath, store)
+  } catch (error) {
+    activeScheduledTaskRuns.delete(taskId)
+    throw error
+  }
+  notifyScheduledTasksUpdated(projectPath)
+
+  let history = null
+  const userMessage = {
+    id: `scheduled-user-${randomUUID()}`,
+    role: "user",
+    content: `【定时任务：${task.name}】\n${task.instruction}`,
+    status: "由定时任务自动发送",
+  }
+  try {
+    history = await getAiChatHistory(projectPath)
+    const requestMessages = [...history.messages, userMessage]
+    const result = await requestAiChat({
+      messages: requestMessages,
+      context: {
+        projectName: path.basename(path.resolve(projectPath)),
+        projectPath: path.resolve(projectPath),
+        chapterName: "",
+        chapterContent: "",
+        chatSummary: history.summary,
+      },
+      allowWriteTools: true,
+    }, () => {}, controller.signal)
+
+    let appliedCount = 0
+    let changeStatus
+    let assistantStatus = "定时任务执行完成"
+    let toolEvents = result.toolEvents
+    if (result.pendingChangeCount > 0 && result.changeSetId) {
+      if (task.autoApplyChanges) {
+        const applied = await applyAiPendingChangeSet(projectPath, result.changeSetId)
+        appliedCount = applied.appliedCount
+        toolEvents = applied.toolEvents
+        changeStatus = "saved"
+        assistantStatus = `定时任务已自动保存 ${appliedCount} 项修改`
+      } else {
+        changeStatus = "pending"
+        assistantStatus = `定时任务有 ${result.pendingChangeCount} 项修改等待确认`
+      }
+    }
+    const assistantMessage = {
+      id: `scheduled-assistant-${randomUUID()}`,
+      role: "assistant",
+      content: result.content,
+      toolEvents,
+      status: assistantStatus,
+      changeSetId: result.changeSetId || undefined,
+      changeStatus,
+      diagnostics: result.diagnostics,
+    }
+    await saveAiChatHistory(projectPath, [...history.messages, userMessage, assistantMessage])
+
+    const finishedAt = new Date().toISOString()
+    const status = changeStatus === "pending" ? "pending-confirmation" : "success"
+    task.status = status
+    task.lastRunAt = finishedAt
+    task.lastScheduledAt = scheduledAt
+    task.lastResult = result.content
+    task.lastError = ""
+    store.runs.unshift({
+      id: randomUUID(),
+      taskId: task.id,
+      taskName: task.name,
+      scheduledAt,
+      startedAt,
+      finishedAt,
+      status,
+      result: result.content,
+      error: "",
+      appliedCount,
+    })
+    const saved = await writeScheduledTaskStore(projectPath, store)
+    notifyScheduledTasksUpdated(projectPath)
+    if (tray && process.platform === "win32") {
+      try {
+        tray.displayBalloon({
+          title: `${task.name} · ${status === "success" ? "已完成" : "等待确认"}`,
+          content: status === "success"
+            ? `已自动保存 ${appliedCount} 项修改`
+            : "打开作者管家查看并确认差异",
+          iconType: status === "success" ? "info" : "warning",
+        })
+      } catch {}
+    }
+    return serializeScheduledTaskStore(saved)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    const finishedAt = new Date().toISOString()
+    task.status = "failed"
+    task.lastRunAt = finishedAt
+    task.lastScheduledAt = scheduledAt
+    task.lastError = message
+    task.lastResult = ""
+    store.runs.unshift({
+      id: randomUUID(),
+      taskId: task.id,
+      taskName: task.name,
+      scheduledAt,
+      startedAt,
+      finishedAt,
+      status: "failed",
+      result: "",
+      error: message,
+      appliedCount: 0,
+    })
+    await writeScheduledTaskStore(projectPath, store).catch(() => {})
+    if (history) {
+      await saveAiChatHistory(projectPath, [
+        ...history.messages,
+        userMessage,
+        {
+          id: `scheduled-error-${randomUUID()}`,
+          role: "assistant",
+          content: `定时任务执行失败：${message}`,
+          status: "定时任务执行失败",
+          hasError: true,
+        },
+      ]).catch(() => {})
+    }
+    notifyScheduledTasksUpdated(projectPath)
+    if (tray && process.platform === "win32") {
+      try {
+        tray.displayBalloon({
+          title: `${task.name} · 执行失败`,
+          content: message.slice(0, 200),
+          iconType: "error",
+        })
+      } catch {}
+    }
+    throw error
+  } finally {
+    activeScheduledTaskRuns.delete(task.id)
+    notifyScheduledTasksUpdated(projectPath)
+  }
+}
+
+async function listLibraryProjectDirectories() {
+  try {
+    const entries = await fs.promises.readdir(getLibraryRoot(), { withFileTypes: true })
+    return entries
+      .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+      .map((entry) => path.join(getLibraryRoot(), entry.name))
+      .filter(isPathInsideLibrary)
+  } catch {
+    return []
+  }
+}
+
+async function checkScheduledTasks() {
+  if (isCheckingScheduledTasks || isQuitting) return
+  isCheckingScheduledTasks = true
+  try {
+    const now = new Date()
+    const projects = await listLibraryProjectDirectories()
+    for (const projectPath of projects) {
+      const store = await readScheduledTaskStore(projectPath).catch(() => null)
+      if (!store) continue
+      for (const task of store.tasks) {
+        if (!task.enabled || activeScheduledTaskRuns.has(task.id)) continue
+        const scheduledDate = getLatestScheduledTaskDate(task, now)
+        if (!scheduledDate) continue
+        const createdAt = Date.parse(task.createdAt) || 0
+        const lastScheduledAt = Date.parse(task.lastScheduledAt || "") || 0
+        if (
+          scheduledDate.getTime() <= createdAt
+          || scheduledDate.getTime() <= lastScheduledAt
+          || now.getTime() - scheduledDate.getTime() > SCHEDULED_TASK_CATCH_UP_MS
+        ) continue
+        if (hasActiveAiSessionForProject(projectPath)) continue
+        if (hasUnsavedWriterWorkspace(projectPath)) continue
+        executeScheduledTask(projectPath, task.id, scheduledDate).catch(() => {})
+        break
+      }
+    }
+  } finally {
+    isCheckingScheduledTasks = false
+  }
+}
+
+function startScheduledTaskService() {
+  if (scheduledTaskCheckTimer) return
+  scheduledTaskStartupTimer = setTimeout(() => {
+    scheduledTaskStartupTimer = null
+    checkScheduledTasks().catch(() => {})
+  }, 10_000)
+  scheduledTaskCheckTimer = setInterval(() => {
+    checkScheduledTasks().catch(() => {})
+  }, SCHEDULED_TASK_CHECK_INTERVAL_MS)
+}
+
+function stopScheduledTaskService() {
+  if (scheduledTaskStartupTimer) clearTimeout(scheduledTaskStartupTimer)
+  if (scheduledTaskCheckTimer) clearInterval(scheduledTaskCheckTimer)
+  scheduledTaskStartupTimer = null
+  scheduledTaskCheckTimer = null
+  for (const run of activeScheduledTaskRuns.values()) {
+    if (!run.controller.signal.aborted) run.controller.abort(createAiRequestCanceledError())
+  }
+  activeScheduledTaskRuns.clear()
 }
 
 function characterGraphServicePath(projectPath) {
@@ -5722,6 +6274,7 @@ app.on("second-instance", showMainWindow)
 app.whenReady().then(() => {
   Menu.setApplicationMenu(null)
   startNodeService()
+  startScheduledTaskService()
   createTray()
   mainWindow = createMainWindow()
   loadRenderer(mainWindow)
@@ -5732,6 +6285,7 @@ app.whenReady().then(() => {
 app.on("before-quit", () => {
   isQuitting = true
   if (mainWindow) saveWindowState(mainWindow)
+  stopScheduledTaskService()
   stopNodeService()
   if (tray) tray.destroy()
 })
@@ -5888,6 +6442,13 @@ ipcMain.handle("settings:force-release-workspace", (event) => {
     }
     activeAiChatSessions.delete(requestKey)
   }
+  for (const [taskId, run] of activeScheduledTaskRuns.entries()) {
+    if (!run.controller.signal.aborted) {
+      run.controller.abort(createAiRequestCanceledError())
+      abortedAiRequests += 1
+    }
+    activeScheduledTaskRuns.delete(taskId)
+  }
   return {
     ok: true,
     abortedAiRequests,
@@ -5897,10 +6458,15 @@ ipcMain.handle("settings:force-release-workspace", (event) => {
 ipcMain.handle("ai:chat", async (event, input) => {
   const requestId = String(input?.requestId || "")
   if (!requestId) throw new Error("AI 请求 ID 无效")
+  const projectPath = String(input?.context?.projectPath || "")
+  if (projectPath && hasActiveScheduledTaskForProject(projectPath)) {
+    throw new Error("当前小说的定时任务正在后台执行，请等待任务完成后再发送")
+  }
   const requestKey = `${event.sender.id}:${requestId}`
   const controller = new AbortController()
   const session = {
     controller,
+    projectPath,
     items: [],
     consumed: [],
   }
@@ -5984,6 +6550,44 @@ ipcMain.handle("ai:clear-history", (_event, projectPath) => (
 ipcMain.handle("ai:compact-history", (_event, projectPath) => (
   compactAiChatHistory(projectPath)
 ))
+
+ipcMain.handle("scheduled-tasks:get", (_event, projectPath) => (
+  getScheduledTasks(projectPath)
+))
+
+ipcMain.handle("scheduled-tasks:save", (_event, projectPath, input) => (
+  saveScheduledTask(projectPath, input)
+))
+
+ipcMain.handle("scheduled-tasks:delete", (_event, projectPath, taskId) => (
+  deleteScheduledTask(projectPath, taskId)
+))
+
+ipcMain.handle("scheduled-tasks:set-enabled", (_event, projectPath, taskId, enabled) => (
+  setScheduledTaskEnabled(projectPath, taskId, enabled)
+))
+
+ipcMain.handle("scheduled-tasks:run-now", (_event, projectPath, taskId) => (
+  executeScheduledTask(projectPath, taskId)
+))
+
+ipcMain.handle("scheduled-tasks:create-weekly-writing-preset", (_event, projectPath, time) => (
+  createWeeklyWritingPreset(projectPath, time)
+))
+
+ipcMain.handle("scheduled-tasks:set-workspace-state", (event, projectPath, input) => {
+  if (!writerWorkspaceStates.has(event.sender.id)) {
+    event.sender.once("destroyed", () => writerWorkspaceStates.delete(event.sender.id))
+  }
+  const normalizedProjectPath = typeof projectPath === "string" && isPathInsideLibrary(projectPath)
+    ? path.resolve(projectPath)
+    : ""
+  writerWorkspaceStates.set(event.sender.id, {
+    projectPath: normalizedProjectPath,
+    isDirty: input?.isDirty === true,
+  })
+  return true
+})
 
 ipcMain.handle("characters:get", (_event, projectPath) => getCharacterGraph(projectPath))
 

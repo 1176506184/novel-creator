@@ -99,6 +99,31 @@ contextBridge.exposeInMainWorld("authorDesk", {
       return () => ipcRenderer.removeListener("ai:chat-progress", listener)
     },
   },
+  scheduledTasks: {
+    get: (projectPath) => ipcRenderer.invoke("scheduled-tasks:get", projectPath),
+    save: (projectPath, input) => ipcRenderer.invoke("scheduled-tasks:save", projectPath, input),
+    delete: (projectPath, taskId) => (
+      ipcRenderer.invoke("scheduled-tasks:delete", projectPath, taskId)
+    ),
+    setEnabled: (projectPath, taskId, enabled) => (
+      ipcRenderer.invoke("scheduled-tasks:set-enabled", projectPath, taskId, enabled)
+    ),
+    runNow: (projectPath, taskId) => (
+      ipcRenderer.invoke("scheduled-tasks:run-now", projectPath, taskId)
+    ),
+    createWeeklyWritingPreset: (projectPath, time) => (
+      ipcRenderer.invoke("scheduled-tasks:create-weekly-writing-preset", projectPath, time)
+    ),
+    setWorkspaceState: (projectPath, input) => (
+      ipcRenderer.invoke("scheduled-tasks:set-workspace-state", projectPath, input)
+    ),
+    onUpdated: (callback) => {
+      if (typeof callback !== "function") return () => {}
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on("scheduled-tasks:updated", listener)
+      return () => ipcRenderer.removeListener("scheduled-tasks:updated", listener)
+    },
+  },
   characters: {
     get: (projectPath) => ipcRenderer.invoke("characters:get", projectPath),
     summarize: (projectPath) => ipcRenderer.invoke("characters:summarize", projectPath),

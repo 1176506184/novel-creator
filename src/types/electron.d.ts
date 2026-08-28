@@ -460,6 +460,59 @@ type GitSettings = {
   hasToken: boolean
 }
 
+type ScheduledTaskStatus = "idle" | "running" | "success" | "failed" | "pending-confirmation"
+
+type ScheduledTask = {
+  id: string
+  name: string
+  instruction: string
+  scheduleType: "daily" | "weekly"
+  time: string
+  weekdays: number[]
+  enabled: boolean
+  autoApplyChanges: boolean
+  presetKey: string
+  createdAt: string
+  updatedAt: string
+  lastRunAt: string | null
+  lastScheduledAt: string | null
+  nextRunAt: string | null
+  status: ScheduledTaskStatus
+  lastResult: string
+  lastError: string
+  isRunning: boolean
+}
+
+type ScheduledTaskRun = {
+  id: string
+  taskId: string
+  taskName: string
+  scheduledAt: string | null
+  startedAt: string | null
+  finishedAt: string | null
+  status: "success" | "failed" | "pending-confirmation"
+  result: string
+  error: string
+  appliedCount: number
+}
+
+type ScheduledTaskState = {
+  ok: boolean
+  tasks: ScheduledTask[]
+  runs: ScheduledTaskRun[]
+}
+
+type ScheduledTaskInput = {
+  id?: string
+  name: string
+  instruction: string
+  scheduleType: "daily" | "weekly"
+  time: string
+  weekdays: number[]
+  enabled: boolean
+  autoApplyChanges: boolean
+}
+
 declare global {
   interface Window {
     authorDesk: {
@@ -573,6 +626,20 @@ declare global {
         clearHistory(projectPath: string): Promise<AiChatHistory>
         compactHistory(projectPath: string): Promise<AiChatCompactResult>
         onChatProgress(callback: (progress: AiChatProgress) => void): () => void
+      }
+      scheduledTasks: {
+        get(projectPath: string): Promise<ScheduledTaskState>
+        save(projectPath: string, input: ScheduledTaskInput): Promise<ScheduledTaskState>
+        delete(projectPath: string, taskId: string): Promise<ScheduledTaskState>
+        setEnabled(
+          projectPath: string,
+          taskId: string,
+          enabled: boolean,
+        ): Promise<ScheduledTaskState>
+        runNow(projectPath: string, taskId: string): Promise<ScheduledTaskState>
+        createWeeklyWritingPreset(projectPath: string, time: string): Promise<ScheduledTaskState>
+        setWorkspaceState(projectPath: string, input: { isDirty: boolean }): Promise<boolean>
+        onUpdated(callback: (payload: { projectPath: string }) => void): () => void
       }
       characters: {
         get(projectPath: string): Promise<CharacterGraphState>

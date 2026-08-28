@@ -12,6 +12,7 @@ import {
   BookOpenText,
   Bot,
   BrainCircuit,
+  CalendarClock,
   Check,
   ChevronDown,
   CircleAlert,
@@ -42,6 +43,7 @@ import { AiMemoryDialog } from "@/components/ai-memory-dialog"
 import { BookBreakdownDialog } from "@/components/book-breakdown-dialog"
 import { CharacterSettingsDialog } from "@/components/character-settings-dialog"
 import { ChapterHistoryDialog } from "@/components/chapter-history-dialog"
+import { ScheduledTasksDialog } from "@/components/scheduled-tasks-dialog"
 import { Button } from "@/components/ui/button"
 import { WritingRulesDialog } from "@/components/writing-rules-dialog"
 import type {
@@ -376,6 +378,8 @@ export function WriterPage({
   const [isCharacterDialogOpen, setIsCharacterDialogOpen] = useState(false)
   const [isWritingRulesDialogOpen, setIsWritingRulesDialogOpen] = useState(false)
   const [isBookBreakdownDialogOpen, setIsBookBreakdownDialogOpen] = useState(false)
+  const [isScheduledTasksDialogOpen, setIsScheduledTasksDialogOpen] = useState(false)
+  const [isScheduledTaskRunning, setIsScheduledTaskRunning] = useState(false)
   const [isAiPanelOpen, setIsAiPanelOpen] = useState(true)
   const [aiMessages, setAiMessages] = useState<AiMessage[]>([])
   const [aiChatSummary, setAiChatSummary] = useState("")
@@ -421,6 +425,11 @@ export function WriterPage({
   isDirtyRef.current = isDirty
   const currentCharacterCount = countCharacters(content)
   const hasPendingAiChanges = aiMessages.some((message) => message.changeStatus === "pending")
+
+  useEffect(() => {
+    window.authorDesk.scheduledTasks.setWorkspaceState(project?.path || "", { isDirty })
+      .catch(() => {})
+  }, [isDirty, project?.path])
 
   const updateAiMessages = useCallback((
     updater: AiMessage[] | ((current: AiMessage[]) => AiMessage[]),
@@ -756,6 +765,8 @@ export function WriterPage({
     setIsCharacterDialogOpen(false)
     setIsWritingRulesDialogOpen(false)
     setIsBookBreakdownDialogOpen(false)
+    setIsScheduledTasksDialogOpen(false)
+    setIsScheduledTaskRunning(false)
     updateAiMessages([])
     setAiChatSummary("")
     setAiCompactedCount(0)
@@ -823,11 +834,46 @@ export function WriterPage({
         if (isCurrent) setIsLoadingChapters(false)
       })
 
+    window.authorDesk.scheduledTasks.get(project.path)
+      .then((taskState) => {
+        if (isCurrent) setIsScheduledTaskRunning(taskState.tasks.some((task) => task.isRunning))
+      })
+      .catch(() => {})
+
     return () => {
       isCurrent = false
       chapterRequestId.current += 1
     }
   }, [loadChapter, project?.path, updateAiMessages, updateAiQueuedPrompts])
+
+  useEffect(() => window.authorDesk.scheduledTasks.onUpdated((payload) => {
+    if (!project || payload.projectPath !== project.path || activeAiRequestIdRef.current) return
+    window.authorDesk.scheduledTasks.get(project.path)
+      .then((taskState) => setIsScheduledTaskRunning(
+        taskState.tasks.some((task) => task.isRunning),
+      ))
+      .catch(() => {})
+    window.authorDesk.ai.getHistory(project.path)
+      .then((history) => {
+        updateAiMessages(history.messages)
+        setAiChatSummary(history.summary)
+        setAiCompactedCount(history.compactedCount)
+      })
+      .catch(() => {})
+    window.authorDesk.project.getChapters(project.path)
+      .then(async (result) => {
+        setChapters(result.chapters)
+        if (!activeChapterName || isDirtyRef.current) return
+        const currentChapter = result.chapters.find((chapter) => chapter.name === activeChapterName)
+        if (!currentChapter) return
+        const nextDocument = await window.authorDesk.project.getChapter(project.path, activeChapterName)
+        if (isDirtyRef.current) return
+        setDocument(nextDocument)
+        setContent(nextDocument.content)
+        onSaved()
+      })
+      .catch(() => {})
+  }), [activeChapterName, onSaved, project?.path, updateAiMessages])
 
   const saveCurrentChapter = useCallback(async () => {
     if (!project || !activeChapterName || !document || isSaving) return false
@@ -1517,14 +1563,106 @@ export function WriterPage({
     updateAiQueuedPrompts((current) => current.filter((item) => item.id !== prompt.id))
   }
 
+  async function sendQueuedPromptNow(prompt: AiQueuedPrompt) {
+    if (!project || prompt.status === "received") return
+    if (!aiConfig.hasApiKey) {
+      setAiNotice("消息仍在待发送区；请先到设置中配置 API Key。")
+      return
+    }
+    if (isScheduledTaskRunning) {
+      setAiNotice("定时任务正在后台执行；完成后才能立即发送这条消息。")
+      return
+    }
+    if (hasPendingAiChanges) {
+      setAiNotice("请先保存或取消待确认修改，再把这条内容作为新消息发送。")
+      return
+    }
+    if (isAiHistoryLoading || isAiCompacting) {
+      setAiNotice("AI 对话正在加载或整理，请稍后再立即发送。")
+      return
+    }
+
+    const activeRequestId = activeAiRequestIdRef.current
+    const activeMessageId = activeAiMessageIdRef.current
+    setAiError("")
+    setAiNotice("")
+    setIsAiStopping(true)
+
+    if (
+      prompt.status === "guiding"
+      && prompt.requestId
+      && prompt.requestId === activeRequestId
+    ) {
+      try {
+        const removed = await window.authorDesk.ai.removeSteer({
+          requestId: prompt.requestId,
+          steerId: prompt.id,
+        })
+        if (!removed) {
+          updateAiQueuedPrompts((current) => current.map((item) => (
+            item.id === prompt.id ? { ...item, status: "received" as const } : item
+          )))
+          setAiNotice("这条引导已经被当前任务接收，为避免重复执行，未再次发送。")
+          setIsAiStopping(false)
+          return
+        }
+      } catch (removeError) {
+        setAiError(removeError instanceof Error
+          ? `无法切换为新消息：${removeError.message}`
+          : "无法将这条引导切换为新消息")
+        setIsAiStopping(false)
+        return
+      }
+    }
+
+    if (activeRequestId) {
+      activeAiRequestIdRef.current = ""
+      activeAiMessageIdRef.current = ""
+      try {
+        await window.authorDesk.ai.cancelChat(activeRequestId)
+      } catch (cancelError) {
+        if (!activeAiRequestIdRef.current) {
+          activeAiRequestIdRef.current = activeRequestId
+          activeAiMessageIdRef.current = activeMessageId
+        }
+        setAiError(cancelError instanceof Error
+          ? `停止当前回复失败：${cancelError.message}`
+          : "停止当前回复失败，暂未发送新消息")
+        setIsAiStopping(false)
+        return
+      }
+    }
+
+    const interruptedMessages = aiMessagesRef.current.flatMap((message) => {
+      if (message.id !== activeMessageId || !message.isStreaming) return [message]
+      if (!message.content.trim()) return []
+      return [{
+        ...message,
+        isStreaming: false,
+        status: "已由新消息打断",
+        hasError: false,
+      }]
+    })
+    updateAiMessages(interruptedMessages)
+    updateAiQueuedPrompts((current) => current.filter((item) => item.id !== prompt.id))
+    setIsAiThinking(false)
+    setIsAiStopping(false)
+    setIsAiQueuePaused(false)
+    runAiMessage(prompt.content)
+    setAiNotice(activeRequestId
+      ? "已停止上一条回复，并在当前对话基础上发送新消息。"
+      : "已在当前对话基础上立即发送。")
+  }
+
   function sendAiMessage(explicitPrompt?: string) {
     const prompt = (explicitPrompt ?? aiInput).trim()
     if (!project || !prompt) return
     setAiInput("")
     setAiError("")
-    if (isAiThinking || isAiHistoryLoading || isAiCompacting || hasPendingAiChanges || !aiConfig.hasApiKey) {
+    if (isAiThinking || isScheduledTaskRunning || isAiHistoryLoading || isAiCompacting || hasPendingAiChanges || !aiConfig.hasApiKey) {
       queueAiGuidance(prompt)
       if (!aiConfig.hasApiKey) setAiNotice("消息已保留；配置 API Key 后即可发送。")
+      else if (isScheduledTaskRunning) setAiNotice("定时任务正在后台执行；消息已保留，完成后会自动发送。")
       else if (hasPendingAiChanges) setAiNotice("消息已进入待发送区；处理完待确认修改后会继续。")
       return
     }
@@ -1537,6 +1675,7 @@ export function WriterPage({
       || !project
       || !aiConfig.hasApiKey
       || isAiThinking
+      || isScheduledTaskRunning
       || isAiHistoryLoading
       || isAiCompacting
       || hasPendingAiChanges
@@ -1553,6 +1692,7 @@ export function WriterPage({
     isAiHistoryLoading,
     isAiQueuePaused,
     isAiThinking,
+    isScheduledTaskRunning,
     project?.path,
     updateAiQueuedPrompts,
   ])
@@ -1679,6 +1819,16 @@ export function WriterPage({
           >
             <BookOpenCheck className="size-4" />
             拆书研究
+          </Button>
+          <Button
+            variant="ghost"
+            className={isScheduledTasksDialogOpen ? "bg-secondary text-primary hover:bg-secondary" : ""}
+            aria-haspopup="dialog"
+            aria-expanded={isScheduledTasksDialogOpen}
+            onClick={() => setIsScheduledTasksDialogOpen(true)}
+          >
+            <CalendarClock className="size-4" />
+            定时任务
           </Button>
           <Button
             variant="ghost"
@@ -2242,15 +2392,37 @@ export function WriterPage({
                           </p>
                         </div>
                         {prompt.status !== "received" && (
-                          <button
-                            type="button"
-                            className="grid size-6 shrink-0 place-items-center rounded-full text-muted-foreground transition-colors hover:bg-red-50 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
-                            aria-label="撤回待发送消息"
-                            title="撤回"
-                            onClick={() => removeQueuedPrompt(prompt)}
-                          >
-                            <X className="size-3" />
-                          </button>
+                          <div className="flex shrink-0 items-center gap-1">
+                            <button
+                              type="button"
+                              className="inline-flex h-6 items-center gap-1 rounded-full bg-primary px-2 text-[9px] font-medium text-white transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground"
+                              aria-label="作为新消息立即发送"
+                              title={isAiThinking
+                                ? "停止当前回复，并作为新消息立即发送"
+                                : "在当前对话基础上立即发送"}
+                              disabled={
+                                !aiConfig.hasApiKey
+                                || hasPendingAiChanges
+                                || isAiHistoryLoading
+                                || isAiCompacting
+                                || isAiStopping
+                                || isScheduledTaskRunning
+                              }
+                              onClick={() => sendQueuedPromptNow(prompt)}
+                            >
+                              <Send className="size-2.5" />
+                              立即发送
+                            </button>
+                            <button
+                              type="button"
+                              className="grid size-6 place-items-center rounded-full text-muted-foreground transition-colors hover:bg-red-50 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+                              aria-label="撤回待发送消息"
+                              title="撤回"
+                              onClick={() => removeQueuedPrompt(prompt)}
+                            >
+                              <X className="size-3" />
+                            </button>
+                          </div>
                         )}
                       </div>
                     ))}
@@ -2271,12 +2443,16 @@ export function WriterPage({
                   aria-label="AI 对话内容"
                   placeholder={isAiThinking
                     ? "继续输入要求，发送后会主动引导当前任务…"
+                    : isScheduledTaskRunning
+                      ? "定时任务正在后台执行，消息会先进入待发送区…"
                     : "向 AI 提问，或让它修改作品文件…"}
                   className="w-full resize-none bg-transparent px-1.5 py-1 text-xs leading-5 outline-none placeholder:text-muted-foreground"
                 />
                 <div className="mt-1 flex items-center justify-between gap-2">
                   <span className="pl-1 text-[10px] text-muted-foreground">
-                    {isAiThinking
+                    {isScheduledTaskRunning
+                      ? "定时任务正在执行 · 输入框保持可用"
+                      : isAiThinking
                       ? isAiStopping
                         ? "正在安全停止当前任务…"
                         : "输入框保持可用 · 发送可引导当前任务"
@@ -2507,6 +2683,12 @@ export function WriterPage({
         open={isBookBreakdownDialogOpen}
         project={project}
         onClose={() => setIsBookBreakdownDialogOpen(false)}
+      />
+
+      <ScheduledTasksDialog
+        open={isScheduledTasksDialogOpen}
+        project={project}
+        onClose={() => setIsScheduledTasksDialogOpen(false)}
       />
 
       {historyChapter && (
